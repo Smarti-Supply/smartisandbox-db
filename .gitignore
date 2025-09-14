@@ -1,0 +1,50 @@
+# 🌐 Arquivos de ambiente
+.env
+.env.local
+.env.*.local
+.env.keys
+
+# 📦 Dependências
+node_modules/
+bower_components/
+
+# 🏗️ Arquivos de build
+dist/
+build/
+
+# 🗃️ Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# 🗄️ Banco de dados
+database-info.txt
+
+# 💻 Arquivos do sistema operacional
+.DS_Store
+Thumbs.db
+
+# 📁 Arquivos temporários
+tmp/
+temp/
+*.tmp
+.temp/
+.branches/
+
+# 🧠 Arquivos de IDEs e configs locais
+documents/
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+
+# ⚙️ Supabase
+.supabase/
+supabase/.cache/
+supabase/.env
+supabase/.env.local
+supabase/.env.*.local

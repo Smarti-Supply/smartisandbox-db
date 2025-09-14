@@ -1,0 +1,2787 @@
+-- ╭────────────────────────────────────────────────────────────────────╮
+-- ┃                            Funções                                 ┃
+-- ╰────────────────────────────────────────────────────────────────────╯
+
+-- Função wrapper da função de log de eventos de processos para utilização em py (não declara schema)
+CREATE OR REPLACE FUNCTION public.fn_log_process_event(
+  p_process_name TEXT,
+  p_function_name TEXT,
+  p_step TEXT,
+  p_status TEXT,
+  p_message TEXT,
+  p_user_id UUID,
+  p_metadata JSONB,
+  token TEXT
+)
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path TO 'private', 'public', 'vault'
+AS $$
+DECLARE
+  expected_token TEXT;
+BEGIN
+  -- Obter o segredo do Vault
+  SELECT decrypted_secret INTO expected_token
+  FROM vault.decrypted_secrets
+  WHERE name = 'AWS_TOKEN';
+
+  IF token IS DISTINCT FROM expected_token THEN
+    RAISE EXCEPTION 'Acesso não autorizado à função.';
+  END IF;
+
+  PERFORM private.fn_log_process_event(
+    p_process_name,
+    p_function_name,
+    p_step,
+    p_status,
+    p_message,
+    p_user_id,
+    p_metadata
+  );
+END;
+$$;
+
+-- Função para processar os logs de processos
+CREATE OR REPLACE FUNCTION private.fn_log_process_event(
+  p_process_name TEXT,
+  p_function_name TEXT,
+  p_step TEXT,
+  p_status TEXT,
+  p_message TEXT,
+  p_user_id UUID,
+  p_metadata JSONB DEFAULT NULL
+)
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path TO 'private', 'public'
+AS $$
+BEGIN
+  INSERT INTO private.process_logs (
+    process_name,
+    function_name,
+    step,
+    status,
+    message,
+    user_id,
+    metadata,
+    created_at
+  )
+  VALUES (
+    p_process_name,
+    p_function_name,
+    p_step,
+    p_status,
+    p_message,
+    p_user_id,
+    p_metadata,
+    now()
+  );
+END;
+$$;
+
+
+-- Função para restaurar o campo de mapeamento padrão
+CREATE OR REPLACE FUNCTION public.fn_reset_field_mapping_by_type(p_type TEXT)
+RETURNS VOID
+SECURITY INVOKER
+SET search_path TO 'public'
+AS $$
+BEGIN
+  -- Atualiza o mapeamento
+  UPDATE public.import_field_mappings
+  SET 
+    field_mapping = default_field_mapping,
+    updated_at = now()
+  WHERE
+    type = p_type;
+END;
+$$ LANGUAGE plpgsql;
+
+
+-- ╭────────────────────◉ CONTEXTO: Usuários ◉─────────────────────────╮
+-- ┃                 Funções de gestão de usuários                      ┃
+-- ╰────────────────────────────────────────────────────────────────────╯
+
+-- Função para criar novos usuários
+CREATE OR REPLACE FUNCTION public.fn_create_new_user(
+  user_email TEXT,
+  user_name TEXT,
+  role TEXT,
+  supplier_letter TEXT, -- Custom field for Transpetro
+  supplier_id BIGINT -- Custom field for Transpetro
+)
+RETURNS VOID
+SECURITY DEFINER
+SET search_path TO 'public', 'vault', 'private'
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  endpoint TEXT := 'create-new-user';
+  edge_token TEXT;
+  service_role_key TEXT;
+  supabase_url TEXT;
+  v_user_id UUID;
+  v_company_id BIGINT;
+  v_is_active BOOLEAN;
+  v_role_name TEXT;
+  v_supplier_letter TEXT; -- Custom field for Transpetro
+  payload JSONB;
+  v_response JSONB;
+  v_uid UUID := (select auth.uid());
+BEGIN
+  SELECT decrypted_secret INTO edge_token
+  FROM vault.decrypted_secrets
+  WHERE name = 'INTERNAL_EDGE_TOKEN';
+
+  SELECT decrypted_secret INTO service_role_key
+  FROM vault.decrypted_secrets
+  WHERE name = 'SUPABASE_SERVICE_ROLE_KEY';
+
+  SELECT decrypted_secret INTO supabase_url
+  FROM vault.decrypted_secrets
+  WHERE name = 'SUPABASE_URL';
+
+  IF user_email IS NULL OR user_name IS NULL OR role IS NULL THEN
+    RAISE EXCEPTION 'Todos os campos são obrigatórios.';
+  END IF;
+
+  IF role NOT IN ('admin', 'comprador') THEN
+    RAISE EXCEPTION 'Role inválida: %', role;
+  END IF;
+  
+  SELECT uac.user_id, uac.company_id, uac.is_active, uac.role_name
+  INTO v_user_id, v_company_id, v_is_active, v_role_name
+  FROM private.user_access_cache uac
+  WHERE uac.user_id = v_uid
+    AND uac.is_active = true
+  LIMIT 1;
+
+  IF NOT (v_is_active AND v_role_name = 'admin') THEN
+    RAISE EXCEPTION 'Apenas administradores ativos podem criar novos usuários.';
+  END IF;
+
+  payload := jsonb_build_object(
+      'company_id', v_company_id,
+      'user_email', user_email,
+      'user_name',  user_name,
+      'role_name',  role,
+      'created_by', v_user_id,
+      'supplier_letter', COALESCE(supplier_letter, ''), -- Custom field for Transpetro
+      'user_supplier_id', supplier_id -- Custom field for Transpetro
+  );
+
+  SELECT net.http_post(
+      url     := supabase_url || '/functions/v1/' || endpoint,
+      headers := jsonb_build_object(
+        'Content-Type',  'application/json',
+        'Authorization', 'Bearer ' || service_role_key,
+        'edge-token',    edge_token
+      ),
+      body := payload
+    ) INTO v_response;
+
+  -- Verificar se houve erro na chamada
+  IF (v_response ->> 'status')::INT >= 400 THEN
+    PERFORM private.fn_log_process_event(
+      p_process_name  := 'create_new_user',
+      p_function_name := 'fn_create_new_user',
+      p_step          := 'edge_call',
+      p_status        := 'error',
+      p_message       := 'Falha ao chamar edge function.',
+      p_user_id       := v_user_id,
+      p_metadata      := jsonb_build_object(
+                            'status', v_response ->> 'status',
+                            'body',   v_response ->> 'body'
+                          )
+    );
+    RAISE EXCEPTION 'Erro ao chamar edge function: %', v_response ->> 'body';
+  END IF;
+
+  -- Sucesso na criação do usuário
+  PERFORM private.fn_log_process_event(
+    p_process_name  := 'create_new_user',
+    p_function_name := 'fn_create_new_user',
+    p_step          := 'create_new_user',
+    p_status        := 'success',
+    p_message       := format('Convite enviado para o e-mail %s.', user_email),
+    p_user_id       := v_user_id,
+    p_metadata      := jsonb_build_object(
+                          'email', user_email,
+                          'role',  role,
+                          'nome',  user_name
+                        )
+  );
+END;
+$$;
+
+
+-- Função para excluir usuários inativos
+CREATE OR REPLACE FUNCTION private.fn_delete_inactive_auth_users()
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path TO 'public', 'auth', 'private'
+AS $$
+DECLARE
+  v_deleted_signed_in INT := 0;
+  v_deleted_never_signed_in INT := 0;
+  v_deleted_inactive INT := 0;
+  deleted_payload JSONB := '[]'::jsonb;
+BEGIN
+  -- 1. Deleta usuários que logaram, mas estão inativos há 30 dias, e não são admin
+  WITH deleted_signed_in AS (
+    DELETE FROM auth.users
+    WHERE id IN (
+      SELECT u.id
+      FROM auth.users u
+      JOIN private.user_access_cache uac ON u.id = uac.user_id
+      WHERE u.last_sign_in_at IS NOT NULL
+        AND u.last_sign_in_at < now() - interval '30 days'
+        AND uac.role_name <> 'admin'
+    )
+    RETURNING id, email
+  )
+  SELECT COALESCE(jsonb_agg(jsonb_build_object(
+    'id', id,
+    'email', email,
+    'reason', 'signed_in_30d'
+  )), '[]') INTO deleted_payload
+  FROM deleted_signed_in;
+
+
+  GET DIAGNOSTICS v_deleted_signed_in = ROW_COUNT;
+
+  -- 2. Deleta usuários que nunca logaram e foram criados há mais de 30 dias, e não são admin
+  WITH deleted_never_signed_in AS (
+    DELETE FROM auth.users
+    WHERE id IN (
+      SELECT u.id
+      FROM auth.users u
+      JOIN private.user_access_cache uac ON u.id = uac.user_id
+      WHERE u.last_sign_in_at IS NULL
+        AND u.created_at < now() - interval '30 days'
+        AND uac.role_name <> 'admin'
+    )
+    RETURNING id, email
+  )
+  SELECT deleted_payload || COALESCE(jsonb_agg(jsonb_build_object(
+    'id', id,
+    'email', email,
+    'reason', 'never_signed_in_30d'
+  )), '[]') INTO deleted_payload
+  FROM deleted_never_signed_in;
+
+  GET DIAGNOSTICS v_deleted_never_signed_in = ROW_COUNT;
+
+  -- 3. Deleta usuários inativos no cache, que não são admin
+  WITH deleted_inactive AS (
+    DELETE FROM auth.users
+    WHERE id IN (
+      SELECT uac.user_id
+      FROM private.user_access_cache uac
+      WHERE uac.is_active = false
+        AND uac.last_synced_at < now() - interval '30 days'
+        AND uac.role_name <> 'admin'
+    )
+    RETURNING id, email
+  )
+  SELECT deleted_payload || COALESCE(jsonb_agg(jsonb_build_object(
+    'id', id,
+    'email', email,
+    'reason', 'inactive_cache'
+  )), '[]') INTO deleted_payload
+  FROM deleted_inactive;
+
+  GET DIAGNOSTICS v_deleted_inactive = ROW_COUNT;
+
+  -- 4. Log final
+  PERFORM private.fn_log_process_event(
+    p_process_name  := 'delete_inactive_auth_users',
+    p_function_name := 'fn_delete_inactive_auth_users',
+    p_step          := 'delete_users',
+    p_status        := 'success',
+    p_message       := 'Execução de limpeza de usuários concluída.',
+    p_user_id       := NULL,
+    p_metadata      := jsonb_build_object(
+        'deletados_signed_in', v_deleted_signed_in,
+        'deletados_never_signed_in', v_deleted_never_signed_in,
+        'deletados_inativos', v_deleted_inactive,
+        'usuarios', deleted_payload
+      )
+  );
+
+EXCEPTION WHEN OTHERS THEN
+  PERFORM private.fn_log_process_event(
+    p_process_name  := 'delete_inactive_auth_users',
+    p_function_name := 'fn_delete_inactive_auth_users',
+    p_step          := 'delete_users',
+    p_status        := 'error',
+    p_message       := SQLERRM,
+    p_user_id       := NULL,
+    p_metadata      := jsonb_build_object(
+        'stack', pg_catalog.pg_backtrace()
+      )
+  );
+  RAISE;
+END; 
+$$;
+
+
+-- ╭─────────────────◉ CONTEXTO: Upload de Dados ◉─────────────────────╮
+-- ┃             Funções upload de pedidos e fornecedores               ┃
+-- ╰────────────────────────────────────────────────────────────────────╯
+
+-- Função para inserir/atualizar pedidos
+CREATE OR REPLACE FUNCTION public.fn_insert_orders(payload JSONB, token TEXT, owner_id TEXT)
+RETURNS VOID
+SECURITY DEFINER
+SET search_path TO 'public', 'vault'
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  expected_token TEXT;
+  record JSONB;
+  supplier_id_resolved BIGINT;
+  parsed_due_date DATE;
+BEGIN
+  -- Obter o segredo do Vault
+  SELECT decrypted_secret INTO expected_token
+  FROM vault.decrypted_secrets
+  WHERE name = 'AWS_TOKEN';
+
+  IF token IS DISTINCT FROM expected_token THEN
+    RAISE EXCEPTION 'Acesso não autorizado à função fn_insert_orders.';
+  END IF;
+
+  PERFORM set_config('request.user_id', owner_id::TEXT, true);
+
+  -- Verifica se o campo company_id está presente
+  IF EXISTS (
+    SELECT 1
+    FROM jsonb_array_elements(payload) AS elem
+    WHERE NOT (elem ? 'company_id')
+  ) THEN
+    PERFORM private.fn_log_process_event(
+    p_process_name  := 'orders_upload',
+    p_function_name := 'fn_insert_orders',
+    p_step          := 'validate_payload',
+    p_status        := 'error',
+    p_message       := 'Registro(s) no payload sem company_id.',
+    p_user_id       := owner_id::uuid,
+    p_metadata      := payload
+  );
+
+    RAISE EXCEPTION 'Algum registro no payload está sem company_id.';
+  END IF;
+
+  FOR record IN SELECT * FROM jsonb_array_elements(payload)
+  LOOP
+    -- Buscar o supplier_id usando o external_id e company_id
+    SELECT id INTO supplier_id_resolved
+    FROM public.suppliers
+    WHERE company_id = (record->>'company_id')::BIGINT
+    AND external_id = record->>'external_id'
+    LIMIT 1;
+
+    IF supplier_id_resolved IS NULL THEN
+        PERFORM private.fn_log_process_event(
+          p_process_name  := 'orders_upload',
+          p_function_name := 'fn_insert_orders',
+          p_step          := 'validate_supplier',
+          p_status        := 'error',
+          p_message       := format('Fornecedor com external_id %s não encontrado para company_id %s.',
+                                    record->>'external_id', record->>'company_id'),
+          p_user_id       := owner_id::uuid,
+          p_metadata      := record
+          );
+      CONTINUE;
+    END IF;
+
+    -- Prepara due_date com segurança
+    parsed_due_date := CASE
+      WHEN record ? 'due_date'
+        AND record->>'due_date' IS DISTINCT FROM 'null'
+        AND record->>'due_date' <> ''
+      THEN (record->>'due_date')::DATE
+      ELSE NULL
+    END;
+
+    INSERT INTO public.orders (
+      company_id,
+      supplier_id,
+      order_number,
+      order_description,
+      due_date
+    )
+    VALUES (
+      (record->>'company_id')::BIGINT,
+      supplier_id_resolved,
+      record->>'order_number',
+      record->>'order_description',
+      parsed_due_date
+    )
+    ON CONFLICT (company_id, order_number) DO UPDATE
+    SET
+      order_description = CASE WHEN record ? 'order_description' THEN record->>'order_description' ELSE orders.order_description END,
+      due_date = CASE
+        WHEN record ? 'due_date'
+          AND record->>'due_date' IS DISTINCT FROM 'null'
+          AND record->>'due_date' <> ''
+        THEN (record->>'due_date')::DATE
+        ELSE orders.due_date
+      END,
+      updated_at = now();
+  END LOOP;
+
+PERFORM private.fn_log_process_event(
+  p_process_name  := 'orders_upload',
+  p_function_name := 'fn_insert_orders',
+  p_step          := 'process_batch',
+  p_status        := 'success',
+  p_message       := 'Lote de pedidos recebido e processado com sucesso.',
+  p_user_id       := owner_id::uuid,
+  p_metadata      := jsonb_build_object(
+                        'total_registros', jsonb_array_length(payload)
+                      )
+);
+END;
+$$;
+
+
+-- Função para inserir/atualizar itens de pedidos
+CREATE OR REPLACE FUNCTION public.fn_insert_order_items(payload JSONB, token TEXT, owner_id TEXT)
+RETURNS VOID
+SECURITY DEFINER
+SET search_path TO 'public', 'vault'
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  expected_token TEXT;
+  record JSONB;
+  processed_orders BIGINT[] := '{}';
+  order_id_lookup BIGINT;
+BEGIN
+  -- Validar token via Vault
+  SELECT decrypted_secret INTO expected_token
+  FROM vault.decrypted_secrets
+  WHERE name = 'AWS_TOKEN';
+
+  IF token IS DISTINCT FROM expected_token THEN
+    RAISE EXCEPTION 'Acesso não autorizado.';
+  END IF;
+
+  PERFORM set_config('request.user_id', owner_id::TEXT, true);
+
+  -- Verifica se o campo company_id está presente
+  IF EXISTS (
+    SELECT 1
+    FROM jsonb_array_elements(payload) AS elem
+    WHERE NOT (elem ? 'company_id')
+  ) THEN
+    PERFORM private.fn_log_process_event(
+    p_process_name  := 'orders_upload',
+    p_function_name := 'fn_insert_order_items',
+    p_step          := 'validate_payload',
+    p_status        := 'error',
+    p_message       := 'Registro(s) no payload sem company_id.',
+    p_user_id       := owner_id::uuid,
+    p_metadata      := payload
+  );
+
+    RAISE EXCEPTION 'Algum registro no payload está sem company_id.';
+  END IF;
+
+  FOR record IN SELECT * FROM jsonb_array_elements(payload)
+  LOOP
+    -- Buscar order_id via order_number
+    SELECT id INTO order_id_lookup
+    FROM public.orders
+    WHERE company_id = (record->>'company_id')::BIGINT
+    AND order_number = record->>'order_number';
+
+    IF order_id_lookup IS NULL THEN
+      PERFORM private.fn_log_process_event(
+        p_process_name  := 'orders_upload',
+        p_function_name := 'fn_insert_order_items',
+        p_step          := 'validate_order',
+        p_status        := 'error',
+        p_message       := format('Pedido com order_number %s não encontrado para company_id %s.',
+                                  record->>'order_number', record->>'company_id'),
+        p_user_id       := owner_id::uuid,
+        p_metadata      := record
+      );
+      CONTINUE;
+    END IF;
+
+    INSERT INTO public.order_items (
+      order_id,
+      item_number,
+      product,
+      product_description,
+      quantity,
+      unity_of_measure,
+      unit_price,
+      plant,
+      due_date,
+      current_delivery_date,
+      status_id,
+      bidding_description,  -- Campo customizado para Transpetro
+      custom_deliver_time,  -- Campo customizado para Transpetro
+      purchase_req,         -- Campo customizado para Transpetro
+      purchase_req_item     -- Campo customizado para Transpetro
+    )
+    VALUES (
+      order_id_lookup,
+      (record->>'item_number')::BIGINT,
+      record->>'product',
+      record->>'product_description',
+      (record->>'quantity')::NUMERIC,
+      record->>'unity_of_measure',
+      (record->>'unit_price')::NUMERIC,
+      record->>'plant',
+      (record->>'due_date')::DATE,
+      (record->>'current_delivery_date')::DATE,
+      (record->>'status_id')::BIGINT,
+      record->>'bidding_description',         -- Campo customizado para Transpetro
+      (record->>'custom_deliver_time')::INT,  -- Campo customizado para Transpetro
+      (record->>'purchase_req')::BIGINT,      -- Campo customizado para Transpetro
+      (record->>'purchase_req_item')::BIGINT  -- Campo customizado para Transpetro
+    )
+    ON CONFLICT (order_id, item_number) DO UPDATE
+    SET
+      product = CASE WHEN record ? 'product' THEN record->>'product' ELSE order_items.product END,
+      product_description = CASE WHEN record ? 'product_description' THEN record->>'product_description' ELSE order_items.product_description END,
+      quantity = CASE WHEN record ? 'quantity' THEN (record->>'quantity')::NUMERIC ELSE order_items.quantity END,
+      unity_of_measure = CASE WHEN record ? 'unity_of_measure' THEN record->>'unity_of_measure' ELSE order_items.unity_of_measure END,
+      unit_price = CASE WHEN record ? 'unit_price' THEN (record->>'unit_price')::NUMERIC ELSE order_items.unit_price END,
+      plant = CASE WHEN record ? 'plant' THEN record->>'plant' ELSE order_items.plant END,
+      due_date = CASE WHEN record ? 'due_date' THEN (record->>'due_date')::DATE ELSE order_items.due_date END,
+      status_id = CASE WHEN record ? 'status_id' THEN (record->>'status_id')::BIGINT ELSE order_items.status_id END,
+      bidding_description = CASE WHEN record ? 'bidding_description' THEN record->>'bidding_description' ELSE order_items.bidding_description END,        -- Campo customizado para Transpetro
+      custom_deliver_time = CASE WHEN record ? 'custom_deliver_time' THEN (record->>'custom_deliver_time')::INT ELSE order_items.custom_deliver_time END, -- Campo customizado para Transpetro
+      purchase_req = CASE WHEN record ? 'purchase_req' THEN (record->>'purchase_req')::BIGINT ELSE order_items.purchase_req END,                          -- Campo customizado para Transpetro
+      purchase_req_item = CASE WHEN record ? 'purchase_req_item' THEN (record->>'purchase_req_item')::BIGINT ELSE order_items.purchase_req_item END;      -- Campo customizado para Transpetro
+
+    -- Armazena o order_id processado
+    IF NOT (processed_orders @> ARRAY[order_id_lookup]) THEN
+      processed_orders := array_append(processed_orders, order_id_lookup);
+    END IF;
+  END LOOP;
+
+  -- Atualiza due_date nos pedidos que ainda não possuem valor
+  UPDATE public.orders o
+  SET due_date = (
+    SELECT MAX(oi.due_date)
+    FROM public.order_items oi
+    WHERE oi.order_id = o.id
+  )
+  WHERE o.id = ANY(processed_orders)
+    AND o.due_date IS NULL;
+
+PERFORM private.fn_log_process_event(
+  p_process_name  := 'orders_upload',
+  p_function_name := 'fn_insert_order_items',
+  p_step          := 'process_batch',
+  p_status        := 'success',
+  p_message       := 'Lote de itens de pedidos recebido e processado com sucesso.',
+  p_user_id       := owner_id::uuid,
+  p_metadata      := jsonb_build_object(
+                        'total_registros', jsonb_array_length(payload),
+                        'pedidos_processados', processed_orders
+                      )
+);
+END;
+$$;
+
+
+-- Função para inserir/atualizar fornecedores
+CREATE OR REPLACE FUNCTION public.fn_insert_suppliers(payload JSONB, token TEXT, owner_id TEXT)
+RETURNS VOID
+SECURITY DEFINER
+SET search_path TO 'public', 'vault'
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  expected_token TEXT;
+  record JSONB;
+BEGIN
+  -- Obter o segredo do Vault
+  SELECT decrypted_secret INTO expected_token
+  FROM vault.decrypted_secrets
+  WHERE name = 'AWS_TOKEN';
+
+  -- Validar token
+  IF token IS DISTINCT FROM expected_token THEN
+    RAISE EXCEPTION 'Acesso não autorizado à função fn_insert_suppliers.';
+  END IF;
+
+  PERFORM set_config('request.user_id', owner_id::TEXT, true);
+
+  -- Verifica se o campo company_id está presente
+  IF EXISTS (
+    SELECT 1
+    FROM jsonb_array_elements(payload) AS elem
+    WHERE NOT (elem ? 'company_id')
+  ) THEN
+    PERFORM private.fn_log_process_event(
+    p_process_name  := 'suppliers_upload',
+    p_function_name := 'fn_insert_suppliers',
+    p_step          := 'validate_payload',
+    p_status        := 'error',
+    p_message       := 'Registro(s) no payload sem company_id.',
+    p_user_id       := owner_id::uuid,
+    p_metadata      := payload
+  );
+    RAISE EXCEPTION 'Algum registro no payload está sem company_id.';
+  END IF;
+
+  -- Iterar sobre os registros do payload
+  FOR record IN SELECT * FROM jsonb_array_elements(payload)
+  LOOP
+    BEGIN
+      INSERT INTO public.suppliers (
+        company_id,
+        external_id,
+        name,
+        cnpj,
+        industry,
+        products_services,
+        website,
+        description,
+        address_street,
+        address_number,
+        address_neighborhood,
+        address_city,
+        address_state,
+        address_country,
+        address_zipcode,
+        address_complement,
+        created_by
+      )
+      VALUES (
+        (record->>'company_id')::BIGINT,
+        record->>'external_id',
+        record->>'name',
+        record->>'cnpj',
+        record->>'industry',
+        record->>'products_services',
+        record->>'website',
+        record->>'description',
+        record->>'address_street',
+        record->>'address_number',
+        record->>'address_neighborhood',
+        record->>'address_city',
+        record->>'address_state',
+        record->>'address_country',
+        record->>'address_zipcode',
+        record->>'address_complement',
+        owner_id::uuid
+      )
+      ON CONFLICT (company_id, external_id) DO UPDATE
+      SET
+        name = EXCLUDED.name,
+        cnpj = EXCLUDED.cnpj,
+        industry = EXCLUDED.industry,
+        products_services = EXCLUDED.products_services,
+        website = EXCLUDED.website,
+        description = EXCLUDED.description,
+        address_street = EXCLUDED.address_street,
+        address_number = EXCLUDED.address_number,
+        address_neighborhood = EXCLUDED.address_neighborhood,
+        address_city = EXCLUDED.address_city,
+        address_state = EXCLUDED.address_state,
+        address_country = EXCLUDED.address_country,
+        address_zipcode = EXCLUDED.address_zipcode,
+        address_complement = EXCLUDED.address_complement;
+    
+    EXCEPTION
+      WHEN unique_violation THEN
+        -- Se conflito for na constraint do CNPJ, atualiza manualmente
+        IF SQLERRM LIKE '%suppliers_company_id_cnpj_key%' THEN
+          BEGIN
+            UPDATE public.suppliers
+            SET
+              name = (record->>'name'),
+              external_id = (record->>'external_id'),
+              industry = (record->>'industry'),
+              products_services = (record->>'products_services'),
+              website = (record->>'website'),
+              description = (record->>'description'),
+              address_street = (record->>'address_street'),
+              address_number = (record->>'address_number'),
+              address_neighborhood = (record->>'address_neighborhood'),
+              address_city = (record->>'address_city'),
+              address_state = (record->>'address_state'),
+              address_country = (record->>'address_country'),
+              address_zipcode = (record->>'address_zipcode'),
+              address_complement = (record->>'address_complement')
+            WHERE company_id = (record->>'company_id')::BIGINT
+              AND cnpj = (record->>'cnpj');
+          EXCEPTION
+            WHEN OTHERS THEN
+              PERFORM private.fn_log_process_event(
+                p_process_name  := 'suppliers_upload',
+                p_function_name := 'fn_insert_suppliers',
+                p_step          := 'update_by_cnpj',
+                p_status        := 'error',
+                p_message       := format('Erro no UPDATE após conflito de CNPJ: %s', SQLERRM),
+                p_user_id       := owner_id::uuid,
+                p_metadata      := record
+              );
+              CONTINUE;
+          END;
+        ELSE
+          -- Conflito inesperado de UNIQUE
+          PERFORM private.fn_log_process_event(
+            p_process_name  := 'suppliers_upload',
+            p_function_name := 'fn_insert_suppliers',
+            p_step          := 'unique_violation',
+            p_status        := 'error',
+            p_message       := format('Unique violation não esperada: %s', SQLERRM),
+            p_user_id       := owner_id::uuid,
+            p_metadata      := record
+          );
+          CONTINUE;
+        END IF;
+      WHEN OTHERS THEN
+        -- Qualquer outro erro geral
+        PERFORM private.fn_log_process_event(
+          p_process_name  := 'suppliers_upload',
+          p_function_name := 'fn_insert_suppliers',
+          p_step          := 'unexpected_error',
+          p_status        := 'error',
+          p_message       := format('Erro inesperado: %s', SQLERRM),
+          p_user_id       := owner_id::uuid,
+          p_metadata      := record
+        );
+        CONTINUE;
+    END;
+  END LOOP;
+
+PERFORM private.fn_log_process_event(
+  p_process_name  := 'suppliers_upload',
+  p_function_name := 'fn_insert_suppliers',
+  p_step          := 'process_batch',
+  p_status        := 'success',
+  p_message       := 'Lote de fornecedores recebido e processado com sucesso.',
+  p_user_id       := owner_id::uuid,
+  p_metadata      := jsonb_build_object(
+                        'total_registros', jsonb_array_length(payload)
+                      )
+);
+END;
+$$;
+
+
+-- Função para inserir/atualizar contatos de fornecedores
+CREATE OR REPLACE FUNCTION public.fn_insert_supplier_contacts(payload JSONB, token TEXT, owner_id TEXT)
+RETURNS VOID
+SECURITY DEFINER
+SET search_path TO 'public', 'vault'
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  expected_token TEXT;
+  record JSONB;
+  supplier_id_resolved BIGINT;
+BEGIN
+  -- Obter o segredo do Vault
+  SELECT decrypted_secret INTO expected_token
+  FROM vault.decrypted_secrets
+  WHERE name = 'AWS_TOKEN';
+
+  -- Validar token
+  IF token IS DISTINCT FROM expected_token THEN
+    RAISE EXCEPTION 'Acesso não autorizado à função fn_insert_supplier_contacts.';
+  END IF;
+
+  PERFORM set_config('request.user_id', owner_id::TEXT, true);
+
+  -- Verifica se o campo company_id está presente
+  IF EXISTS (
+    SELECT 1
+    FROM jsonb_array_elements(payload) AS elem
+    WHERE NOT (elem ? 'company_id')
+  ) THEN
+    PERFORM private.fn_log_process_event(
+    p_process_name  := 'suppliers_upload',
+    p_function_name := 'fn_insert_supplier_contacts',
+    p_step          := 'validate_payload',
+    p_status        := 'error',
+    p_message       := 'Registro(s) no payload sem company_id.',
+    p_user_id       := owner_id::uuid,
+    p_metadata      := payload
+  );
+    RAISE EXCEPTION 'Algum registro no payload está sem company_id.';
+  END IF;
+
+  -- Iterar sobre os registros do payload
+  FOR record IN SELECT * FROM jsonb_array_elements(payload)
+  LOOP
+    -- Resolver supplier_id usando company_id + external_id
+    SELECT id INTO supplier_id_resolved
+    FROM public.suppliers
+    WHERE company_id = (record->>'company_id')::BIGINT
+    AND external_id = record->>'external_id';
+
+    IF supplier_id_resolved IS NULL THEN
+        PERFORM private.fn_log_process_event(
+          p_process_name  := 'suppliers_upload',
+          p_function_name := 'fn_insert_supplier_contacts',
+          p_step          := 'resolver_supplier_id',
+          p_status        := 'error',
+          p_message       := format('Fornecedor com external_id %s não encontrado para company_id %s.', record->>'external_id', record->>'company_id'),
+          p_user_id      := owner_id::uuid,
+          p_metadata     := record
+        );
+      CONTINUE;
+    END IF;
+
+    -- Inserir ou atualizar contato
+    INSERT INTO public.supplier_contacts (
+      supplier_id,
+      name,
+      email,
+      phone,
+      created_by
+    )
+    VALUES (
+      supplier_id_resolved,
+      record->>'name',
+      record->>'email',
+      record->>'phone',
+      owner_id::uuid
+    )
+    ON CONFLICT (supplier_id, email) DO UPDATE
+    SET
+      name = EXCLUDED.name,
+      phone = EXCLUDED.phone;
+  END LOOP;
+
+PERFORM private.fn_log_process_event(
+  p_process_name  := 'suppliers_upload',
+  p_function_name := 'fn_insert_supplier_contacts',
+  p_step          := 'process_batch',
+  p_status        := 'success',
+  p_message       := 'Lote de contatos de fornecedores recebido e processado com sucesso.',
+  p_user_id       := owner_id::uuid,
+  p_metadata      := jsonb_build_object(
+                        'total_registros', jsonb_array_length(payload)
+                      )
+);
+END;
+$$;
+
+
+-- ╭───────────────────◉ CONTEXTO: Atualização ◉───────────────────────╮
+-- ┃               Funções de atualização de pedidos                    ┃
+-- ╰────────────────────────────────────────────────────────────────────╯
+
+-- Função para atualizar o status de pedidos
+CREATE OR REPLACE FUNCTION public.fn_update_order_status(
+    p_order_id BIGINT,
+    p_status_id INT
+)
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path TO 'public', 'private'
+AS $$
+DECLARE
+    v_uid UUID := (select auth.uid());
+    v_company_id BIGINT;
+    v_role_name TEXT;
+    v_supplier_id BIGINT;
+    v_supplier_contact_id BIGINT;
+BEGIN
+    -- Captura company_id da sessão
+    SELECT uac.company_id, uac.role_name, uac.supplier_id
+    INTO v_company_id, v_role_name, v_supplier_id
+    FROM private.user_access_cache uac
+    WHERE uac.user_id = v_uid
+      AND uac.is_active = true
+    LIMIT 1;
+
+    IF NOT FOUND THEN
+      RAISE EXCEPTION 'Usuário % não encontrado ou sem acesso.', v_uid;
+    END IF;
+
+    IF v_role_name IN ('admin', 'comprador') AND p_status_id = 6 THEN
+        PERFORM set_config('request.source', 'client', true);
+        PERFORM set_config('request.user_id', v_uid::TEXT, true);
+
+    ELSIF v_role_name = 'fornecedor' AND p_status_id IN (2, 3, 4) THEN
+
+        SELECT sc.id
+        INTO v_supplier_contact_id
+        FROM public.supplier_contacts sc
+        JOIN public.supplier_users su ON su.supplier_contact_id = sc.id
+        WHERE su.id = v_uid
+          AND sc.is_active = true
+        LIMIT 1;
+
+        PERFORM set_config('request.source', 'supplier', true);
+        PERFORM set_config('request.supplier_contact_id', v_supplier_contact_id::TEXT, true);
+
+    ELSE
+        RAISE EXCEPTION 'Acesso negado: usuário % não possui permissão para atualizar pedidos.', v_uid;
+    END IF;
+
+    -- Atualiza o status do pedido
+    UPDATE public.orders
+    SET status_id = p_status_id
+    WHERE id = p_order_id
+      AND company_id = v_company_id
+      AND status_id IS DISTINCT FROM p_status_id;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Pedido % não encontrado ou acesso negado.', p_order_id;
+    END IF;
+END;
+$$;
+
+
+-- Função para atualizar campos de itens de pedidos
+CREATE OR REPLACE FUNCTION public.fn_update_order_items_fields(
+    p_order_id BIGINT,
+    p_order_item_id BIGINT,
+    p_status_id BIGINT DEFAULT NULL,
+    p_current_delivery_date DATE DEFAULT NULL
+)
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path TO 'public', 'private'
+AS $$
+DECLARE
+    v_uid UUID := (SELECT auth.uid());
+    v_company_id BIGINT;
+    v_role_name TEXT;
+    v_supplier_id BIGINT;
+    v_supplier_contact_id BIGINT;
+    v_status_name TEXT;
+BEGIN
+    IF p_status_id IS NULL AND p_current_delivery_date IS NULL THEN
+        RAISE EXCEPTION 'Pelo menos um dos parâmetros p_status_id ou p_current_delivery_date deve ser fornecido.';
+    END IF;
+
+    -- Captura sessão do usuário
+    SELECT uac.company_id, uac.role_name, uac.supplier_id
+    INTO v_company_id, v_role_name, v_supplier_id
+    FROM private.user_access_cache uac
+    WHERE uac.user_id = v_uid
+      AND uac.is_active = true
+    LIMIT 1;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Usuário % não encontrado ou sem acesso.', v_uid;
+    END IF;
+
+    -- Cliente ou Comprador
+    IF v_role_name IN ('admin', 'comprador') THEN
+        IF p_current_delivery_date IS NOT NULL THEN
+            RAISE EXCEPTION 'Usuários com papel % não têm permissão para alterar a data de entrega do item.', v_role_name;
+        END IF;
+
+        PERFORM set_config('request.source', 'client', true);
+        PERFORM set_config('request.user_id', v_uid::TEXT, true);
+
+    -- Fornecedor
+    ELSIF v_role_name = 'fornecedor' THEN
+        -- Verifica se o status é permitido ao fornecedor
+        IF p_status_id IS NOT NULL THEN
+            SELECT name
+            INTO v_status_name
+            FROM public.order_item_status
+            WHERE id = p_status_id
+              AND expose_to_supplier = true
+              AND company_id = v_company_id
+            LIMIT 1;
+
+            IF NOT FOUND THEN
+                RAISE EXCEPTION 'O status informado (ID: %) não é permitido para fornecedores ou não existe.', p_status_id;
+            END IF;
+        END IF;
+
+        SELECT sc.id
+        INTO v_supplier_contact_id
+        FROM public.supplier_contacts sc
+        JOIN public.supplier_users su ON su.supplier_contact_id = sc.id
+        WHERE su.id = v_uid
+          AND sc.is_active = true
+        LIMIT 1;
+
+        PERFORM set_config('request.source', 'supplier', true);
+        PERFORM set_config('request.supplier_contact_id', v_supplier_contact_id::TEXT, true);
+    ELSE
+        RAISE EXCEPTION 'Acesso negado: usuário % não possui permissão para atualizar pedidos.', v_uid;
+    END IF;
+
+    -- Atualiza apenas os campos informados
+    IF p_status_id IS NOT NULL AND p_current_delivery_date IS NOT NULL THEN
+        UPDATE public.order_items
+        SET status_id = p_status_id,
+            current_delivery_date = p_current_delivery_date
+        WHERE id = p_order_item_id
+          AND order_id = p_order_id;
+
+    ELSIF p_status_id IS NOT NULL THEN
+        UPDATE public.order_items
+        SET status_id = p_status_id
+        WHERE id = p_order_item_id
+          AND order_id = p_order_id;
+
+    ELSIF p_current_delivery_date IS NOT NULL THEN
+        UPDATE public.order_items
+        SET current_delivery_date = p_current_delivery_date
+        WHERE id = p_order_item_id
+          AND order_id = p_order_id;
+    END IF;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Item % do Pedido % não encontrado ou acesso negado.', p_order_item_id, p_order_id;
+    END IF;
+END;
+$$;
+
+-- Função para inserir fatura de item de pedido
+CREATE OR REPLACE FUNCTION public.fn_insert_order_item_invoice(
+    p_order_item_id BIGINT,
+    p_nfe_number TEXT,
+    p_nfe_date DATE,
+    p_quantity NUMERIC(12,2),
+    p_invoiced_value NUMERIC(12,2),
+    p_volumes TEXT DEFAULT NULL
+)
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path TO 'public', 'private'
+AS $$
+DECLARE
+    v_uid UUID := (SELECT auth.uid());
+    v_role_name TEXT;
+    v_supplier_id BIGINT;
+    v_supplier_contact_id BIGINT;
+    v_order_item_exists BOOLEAN;
+BEGIN
+    -- Validar campos obrigatórios
+    IF p_nfe_number IS NULL OR trim(p_nfe_number) = '' THEN
+        RAISE EXCEPTION 'Número da NFe não pode ser vazio.';
+    ELSIF p_nfe_date IS NULL THEN
+        RAISE EXCEPTION 'Data da NFe não pode ser nula.';
+    ELSIF p_quantity IS NULL OR p_quantity <= 0 THEN
+        RAISE EXCEPTION 'Quantidade faturada deve ser maior que zero.';
+    ELSIF p_invoiced_value IS NULL OR p_invoiced_value < 0 THEN
+        RAISE EXCEPTION 'Valor faturado não pode ser negativo.';
+    END IF;
+
+    -- Captura sessão do usuário
+    SELECT uac.role_name, uac.supplier_id
+    INTO v_role_name, v_supplier_id
+    FROM private.user_access_cache uac
+    WHERE uac.user_id = v_uid
+      AND uac.is_active = true
+    LIMIT 1;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Usuário % não encontrado ou sem acesso.', v_uid;
+    END IF;
+
+    -- Verifica se item pertence a algum pedido (proteção contra inserção fantasiosa)
+    SELECT EXISTS (
+        SELECT 1
+        FROM public.order_items oi
+        JOIN public.orders o ON o.id = oi.order_id
+        WHERE oi.id = p_order_item_id
+          AND o.supplier_id = v_supplier_id
+    ) INTO v_order_item_exists;
+
+    IF NOT v_order_item_exists THEN
+        RAISE EXCEPTION 'Item de pedido % não encontrado ou não pertence ao fornecedor.', p_order_item_id;
+    END IF;
+
+    -- Fornecedor
+    IF v_role_name = 'fornecedor' THEN
+        SELECT sc.id
+        INTO v_supplier_contact_id
+        FROM public.supplier_contacts sc
+        JOIN public.supplier_users su ON su.supplier_contact_id = sc.id
+        WHERE su.id = v_uid
+          AND sc.is_active = true
+        LIMIT 1;
+
+        PERFORM set_config('request.source', 'supplier', true);
+        PERFORM set_config('request.supplier_contact_id', v_supplier_contact_id::TEXT, true);
+    ELSE
+        RAISE EXCEPTION 'Acesso negado: usuário % não tem permissão para inserir faturamentos.', v_uid;
+    END IF;
+
+    -- Inserir fatura
+    INSERT INTO public.order_item_invoices (
+        order_item_id,
+        nfe_number,
+        nfe_date,
+        quantity,
+        invoiced_value,
+        volumes,
+        created_by
+    )
+    VALUES (
+        p_order_item_id,
+        p_nfe_number,
+        p_nfe_date,
+        p_quantity,
+        p_invoiced_value,
+        p_volumes,
+        v_uid
+    );
+END;
+$$;
+
+-- Função para inserir observações do fornecedor
+CREATE OR REPLACE FUNCTION public.fn_insert_supplier_observations(
+    p_order_id BIGINT,
+    p_supplier_observations TEXT,
+    p_created_by UUID
+)
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path TO 'public', 'private'
+AS $$
+DECLARE
+    v_uid UUID := (select auth.uid());
+    v_company_id BIGINT;
+    v_role_name TEXT;
+    v_supplier_id BIGINT;
+    v_supplier_contact_id BIGINT;
+    v_order_company_id BIGINT;
+BEGIN
+    -- Captura company_id da sessão
+    SELECT uac.company_id, uac.role_name, uac.supplier_id
+    INTO v_company_id, v_role_name, v_supplier_id
+    FROM private.user_access_cache uac
+    WHERE uac.user_id = v_uid
+      AND uac.is_active = true
+    LIMIT 1;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Usuário % não encontrado ou sem acesso.', v_uid;
+    END IF;
+
+    -- Verifica se o usuário tem role 'fornecedor'
+    IF v_role_name <> 'fornecedor' THEN
+        RAISE EXCEPTION 'Acesso negado: apenas usuários com role "fornecedor" podem inserir observações.';
+    END IF;
+
+    -- Verifica se o pedido existe e pertence à empresa do usuário
+    SELECT company_id
+    INTO v_order_company_id
+    FROM public.orders
+    WHERE id = p_order_id;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Pedido % não encontrado.', p_order_id;
+    END IF;
+
+    IF v_order_company_id <> v_company_id THEN
+        RAISE EXCEPTION 'Acesso negado: pedido % não pertence à empresa do usuário.', p_order_id;
+    END IF;
+
+    -- Captura o supplier_contact_id para o trigger
+    SELECT sc.id
+    INTO v_supplier_contact_id
+    FROM public.supplier_contacts sc
+    JOIN public.supplier_users su ON su.supplier_contact_id = sc.id
+    WHERE su.id = v_uid
+      AND sc.is_active = true
+    LIMIT 1;
+
+    -- Define variáveis de contexto para o trigger
+    PERFORM set_config('request.source', 'supplier', true);
+    PERFORM set_config('request.supplier_contact_id', v_supplier_contact_id::TEXT, true);
+    PERFORM set_config('request.user_id', v_uid::TEXT, true);
+
+    -- Insere a observação na tabela
+    INSERT INTO public.order_and_item_observations (
+        order_id,
+        supplier_observations,
+        created_by
+    ) VALUES (
+        p_order_id,
+        p_supplier_observations,
+        p_created_by
+    );
+
+END;
+$$;
+
+-- ╭─────────────────◉ CONTEXTO: Envio de Emails ◉─────────────────────╮
+-- ┃                   Funções de envio de emails                       ┃
+-- ╰────────────────────────────────────────────────────────────────────╯
+
+-- Função para criar payload para enviar e-mails de follow-up via cron
+CREATE OR REPLACE FUNCTION private.fn_send_payload_followup_cron(
+    p_company_id BIGINT,
+    supplier_ids BIGINT[] DEFAULT NULL,
+    order_ids BIGINT[] DEFAULT NULL,
+    user_observations TEXT DEFAULT NULL,
+    template_html TEXT DEFAULT NULL,
+    setting_id BIGINT DEFAULT NULL
+)
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path TO 'public', 'private'
+AS $$
+DECLARE
+    payload JSONB := '[]'::JSONB;
+    suppliers_to_process BIGINT[];
+    supplier RECORD;
+    supplier_contacts TEXT[];
+    orders RECORD;
+    orders_payload JSONB;
+    supplier_payload JSONB;
+    html_template_final TEXT;
+BEGIN
+    -- Validar se company_id foi fornecido
+    IF p_company_id IS NULL THEN
+        RAISE EXCEPTION 'company_id é obrigatório para execução via cron';
+    END IF;
+
+    -- Carrega o template, se não informado
+    IF template_html IS NULL THEN
+        SELECT email_template INTO html_template_final
+        FROM public.followup_settings
+        WHERE company_id = p_company_id
+        AND trigger_scope = 'manual_user_trigger'
+        AND is_active = TRUE
+        ORDER BY id DESC
+        LIMIT 1;
+        
+        IF html_template_final IS NULL THEN
+            RAISE EXCEPTION 'Nenhum template configurado para follow-up manual (manual_user_trigger)';
+        END IF;
+    ELSE
+        html_template_final := template_html;
+    END IF;
+
+    -- Define os suppliers a processar
+    IF order_ids IS NOT NULL AND array_length(order_ids, 1) IS NOT NULL THEN
+        SELECT array_agg(DISTINCT o.supplier_id) INTO suppliers_to_process
+        FROM public.orders o
+        JOIN public.default_order_status dos ON o.status_id = dos.id
+        WHERE o.company_id = p_company_id
+        AND o.id = ANY(order_ids)
+        AND dos.is_final = FALSE;
+    ELSIF supplier_ids IS NOT NULL AND array_length(supplier_ids, 1) IS NOT NULL THEN
+        suppliers_to_process := supplier_ids;
+    ELSE
+        SELECT array_agg(DISTINCT supplier_id) INTO suppliers_to_process
+        FROM public.orders o
+        JOIN public.default_order_status dos ON o.status_id = dos.id
+        WHERE o.company_id = p_company_id
+        AND dos.is_final = FALSE;
+    END IF;
+
+    -- Loop de fornecedores
+    FOR supplier IN
+        SELECT id, name
+        FROM public.suppliers
+        WHERE id = ANY(suppliers_to_process)
+        AND company_id = p_company_id
+    LOOP
+      BEGIN
+        -- Buscar contatos do fornecedor
+        SELECT array_agg(name || ' <' || email || '>') INTO supplier_contacts
+        FROM public.supplier_contacts
+        WHERE supplier_id = supplier.id
+        AND is_active = TRUE;
+
+        -- Pula se não houver contatos
+        IF supplier_contacts IS NULL OR array_length(supplier_contacts, 1) = 0 THEN
+            CONTINUE;
+        END IF;
+
+        -- Montar pedidos do fornecedor - MESMA ESTRUTURA DA FUNÇÃO ORIGINAL
+        orders_payload := '[]'::JSONB;
+        
+        FOR orders IN
+            SELECT id, order_number, items
+            FROM (
+                SELECT
+                    o.id,
+                    o.supplier_id,
+                    o.order_number,
+                    COALESCE(array_agg(oi.item_number), ARRAY[]::BIGINT[]) AS items
+                FROM public.orders o
+                JOIN public.default_order_status dos ON o.status_id = dos.id
+                LEFT JOIN public.order_items oi ON oi.order_id = o.id
+                WHERE o.company_id = p_company_id
+                AND dos.is_final = FALSE
+                AND (
+                    (order_ids IS NOT NULL AND o.id = ANY(order_ids)) OR
+                    (order_ids IS NULL)
+                )
+                GROUP BY o.supplier_id, o.order_number, o.id
+            ) orders_with_items
+            WHERE supplier_id = supplier.id
+        LOOP
+            -- CORREÇÃO: usar order_number como na função original, não order_id
+            orders_payload := orders_payload || jsonb_build_object(
+                'order_id', orders.id,
+                'order_number', orders.order_number,
+                'items', orders.items
+            );
+        END LOOP;
+
+        -- Montar bloco de payload do fornecedor
+        supplier_payload := jsonb_build_object(
+            'supplier_id', supplier.id,
+            'supplier_contacts', to_jsonb(supplier_contacts),
+            'orders_payload', orders_payload,
+            'user_observations', COALESCE(user_observations, ''),
+            'template_html', html_template_final,
+            'setting_id', setting_id
+        );
+
+        payload := payload || jsonb_build_array(supplier_payload);
+
+      EXCEPTION
+        WHEN OTHERS THEN
+          PERFORM private.fn_log_process_event(
+            p_process_name  := 'send_followup_emails_cron',
+            p_function_name := 'fn_send_payload_followup_cron',
+            p_step          := 'supplier_payload',
+            p_status        := 'error',
+            p_message       := format('Erro ao montar payload para fornecedor %s (%s): %s', supplier.name, supplier.id, SQLERRM),
+            p_user_id       := NULL,
+            p_metadata      := jsonb_build_object(
+                                  'supplier_id', supplier.id,
+                                  'company_id', p_company_id
+                                )
+          );
+          CONTINUE;
+      END;
+    END LOOP;
+    
+    IF jsonb_array_length(payload) = 0 THEN
+      PERFORM private.fn_log_process_event(
+        p_process_name  := 'send_followup_emails_cron',
+        p_function_name := 'fn_send_payload_followup_cron',
+        p_step          := 'empty_payload',
+        p_status        := 'warning',
+        p_message       := 'Nenhum payload válido foi gerado. Nenhum follow-up será enviado.',
+        p_user_id       := NULL,
+        p_metadata      := jsonb_build_object(
+                              'company_id', p_company_id
+                            )
+      );
+      RETURN;
+    END IF;
+
+    PERFORM private.fn_log_process_event(
+      p_process_name  := 'send_followup_emails_cron',
+      p_function_name := 'fn_send_payload_followup_cron',
+      p_step          := 'build_payload',
+      p_status        := 'success',
+      p_message       := 'Payload de fornecedores montado com sucesso para envio de follow-up.',
+      p_user_id       := NULL,
+      p_metadata      := jsonb_build_object(
+                            'total_fornecedores', jsonb_array_length(payload),
+                            'executado_para_company_id', p_company_id
+                        )
+    );
+
+  BEGIN
+    -- Usar a função específica para cron
+    PERFORM private.fn_send_followup_emails_cron(payload, p_company_id);
+  EXCEPTION
+    WHEN OTHERS THEN
+      PERFORM private.fn_log_process_event(
+        p_process_name  := 'send_followup_emails_cron',
+        p_function_name := 'fn_send_payload_followup_cron',
+        p_step          := 'send_payload',
+        p_status        := 'error',
+        p_message       := format('Erro ao executar fn_send_followup_emails_cron: %s', SQLERRM),
+        p_user_id       := NULL,
+        p_metadata      := jsonb_build_object(
+                              'payload_parcial', payload,
+                              'company_id', p_company_id
+                            )
+      );
+  END;
+END;
+$$;
+
+-- Função específica para uso pelo cron (sem depender de autenticação)
+CREATE OR REPLACE FUNCTION private.fn_send_followup_emails_cron(
+    supplier_payload JSONB,
+    in_company_id BIGINT
+)
+RETURNS VOID
+SECURITY DEFINER
+SET search_path TO 'public', 'vault', 'private'
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    edge_token TEXT;
+    service_role_key TEXT;
+    supabase_url TEXT;
+    endpoint TEXT := 'send-followup';
+    -- variáveis do loop externo
+    entry JSONB;
+    supplier_id BIGINT;
+    supplier_contacts TEXT[];
+    template_html TEXT;
+    orders_payload JSONB;
+    user_observations TEXT;
+    setting_id BIGINT;
+    -- variáveis do loop interno
+    enriched_payload JSONB;
+    supplier_contacts_slice TEXT[];
+    v_response JSONB;
+    -- (sem autenticação)
+    company_name TEXT;
+BEGIN
+    -- Validar parâmetros obrigatórios
+    IF in_company_id IS NULL THEN
+        RAISE EXCEPTION 'company_id é obrigatório para execução via cron';
+    END IF;
+
+    -- Buscar secrets - MESMA ORDEM DA FUNÇÃO ORIGINAL
+    SELECT decrypted_secret INTO edge_token
+    FROM vault.decrypted_secrets
+    WHERE name = 'INTERNAL_EDGE_TOKEN';
+
+    SELECT decrypted_secret INTO service_role_key
+    FROM vault.decrypted_secrets
+    WHERE name = 'SUPABASE_SERVICE_ROLE_KEY';
+
+    SELECT decrypted_secret INTO supabase_url
+    FROM vault.decrypted_secrets
+    WHERE name = 'SUPABASE_URL';
+
+    -- Nome da empresa
+    SELECT name INTO company_name
+    FROM public.companies
+    WHERE id = in_company_id;
+
+    -- Loop externo: para cada entry no JSON de fornecedores
+    FOR entry IN
+        SELECT * FROM jsonb_array_elements(supplier_payload)
+    LOOP
+        supplier_id := (entry ->> 'supplier_id')::BIGINT;
+        template_html := entry ->> 'template_html';
+        orders_payload := entry -> 'orders_payload';
+        user_observations := entry ->> 'user_observations';
+        setting_id := (entry ->> 'setting_id')::BIGINT;
+
+        -- Converte JSON array para TEXT[]
+        supplier_contacts := ARRAY(
+            SELECT jsonb_array_elements_text(entry -> 'supplier_contacts')
+        );
+
+        -- quebra o array de contatos em batches de até 100
+        FOR i IN 1..CEIL(array_length(supplier_contacts, 1) / 100.0)::BIGINT LOOP
+            -- fatia os contatos
+            supplier_contacts_slice := supplier_contacts[
+                (i - 1) * 100 + 1 : LEAST(i * 100, array_length(supplier_contacts, 1))
+            ];
+
+            enriched_payload := jsonb_build_object(
+                'user_id', NULL::UUID,  -- Diferença: NULL em vez de v_user_id
+                'supplier_id', supplier_id,
+                'supplier_contacts', to_jsonb(supplier_contacts_slice),
+                'orders_payload', orders_payload,
+                'company_id', in_company_id,  -- Diferença: usar in_company_id em vez de v_company_id
+                'company_name', company_name,
+                'user_observations', user_observations,
+                'template_html', template_html,
+                'setting_id', setting_id
+            );
+
+            SELECT net.http_post(
+                url := supabase_url || '/functions/v1/' || endpoint,
+                headers := jsonb_build_object(
+                    'Content-Type', 'application/json',
+                    'Authorization', 'Bearer ' || service_role_key,
+                    'edge-token', edge_token
+                ),
+                body := jsonb_build_array(enriched_payload)
+            ) INTO v_response;
+
+            IF (v_response ->> 'status')::INT >= 400 THEN
+              PERFORM private.fn_log_process_event(
+                p_process_name  := 'send_followup_emails_cron',
+                p_function_name := 'fn_send_followup_emails_cron',
+                p_step          := 'edge_call',
+                p_status        := 'error',
+                p_message       := format('Erro ao enviar follow-up: %s', v_response ->> 'body'),
+                p_user_id       := NULL::UUID,
+                p_metadata      := jsonb_build_object(
+                                      'contatos', supplier_contacts_slice,
+                                      'status', v_response ->> 'status'
+                                    )
+              );
+              CONTINUE;
+            END IF;
+
+            PERFORM private.fn_log_process_event(
+                p_process_name  := 'send_followup_emails_cron',
+                p_function_name := 'fn_send_followup_emails_cron',
+                p_step          := 'edge_call',
+                p_status        := 'success',
+                p_message       := 'Follow-up enviado via cron para batch de ' || array_length(supplier_contacts_slice, 1) || ' contatos',
+                p_user_id       := NULL::UUID,  -- Diferença: NULL em vez de v_user_id
+                p_metadata      := entry
+            );
+        END LOOP;
+    END LOOP;
+END;
+$$;
+
+
+-- Função para criar payload para enviar e-mails de follow-up
+CREATE OR REPLACE FUNCTION public.fn_send_payload_followup(
+  supplier_ids BIGINT[] DEFAULT NULL,
+  order_ids    BIGINT[] DEFAULT NULL,
+  user_observations TEXT DEFAULT NULL,
+  template_html     TEXT DEFAULT NULL
+)
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path TO 'public', 'private'
+AS $$
+DECLARE
+  payload JSONB := '[]'::JSONB;
+  suppliers_to_process BIGINT[];
+  supplier RECORD;
+  supplier_contacts TEXT[];
+  orders RECORD;
+  orders_payload JSONB;
+  supplier_payload JSONB;
+  html_template_final TEXT;
+  v_company_id BIGINT;
+  v_uid UUID := (select auth.uid());
+BEGIN
+  -- Captura company_id da sessão
+  SELECT uac.company_id INTO v_company_id
+  FROM private.user_access_cache uac
+  WHERE uac.user_id = v_uid
+    AND uac.is_active = true
+    AND uac.role_name IN ('admin', 'comprador')
+  LIMIT 1;
+
+  IF v_company_id IS NULL THEN
+    RAISE EXCEPTION 'Acesso negado: company_id não encontrado para o usuário % no cache de acesso.', v_uid;
+  END IF;
+
+  -- Carrega o template, se não informado
+  IF template_html IS NULL THEN
+    SELECT email_template INTO html_template_final
+    FROM public.followup_settings
+    WHERE company_id = v_company_id
+      AND trigger_scope = 'manual_user_trigger'
+      AND is_active = TRUE
+    ORDER BY id DESC
+    LIMIT 1;
+
+    IF html_template_final IS NULL THEN
+      RAISE EXCEPTION 'Nenhum template configurado para follow-up manual (manual_user_trigger)';
+    END IF;
+  ELSE
+    html_template_final := template_html;
+  END IF;
+
+  -- Define os suppliers a processar
+  IF order_ids IS NOT NULL AND array_length(order_ids, 1) IS NOT NULL THEN
+    SELECT array_agg(DISTINCT o.supplier_id) INTO suppliers_to_process
+    FROM public.orders o
+    JOIN public.default_order_status dos ON o.status_id = dos.id
+    WHERE o.company_id = v_company_id
+      AND o.id = ANY(order_ids)
+      AND dos.is_final = FALSE;
+
+  ELSIF supplier_ids IS NOT NULL AND array_length(supplier_ids, 1) IS NOT NULL THEN
+    suppliers_to_process := supplier_ids;
+
+  ELSE
+    SELECT array_agg(DISTINCT supplier_id) INTO suppliers_to_process
+    FROM public.orders o
+    JOIN public.default_order_status dos ON o.status_id = dos.id
+    WHERE o.company_id = v_company_id
+      AND dos.is_final = FALSE;
+  END IF;
+
+  -- Loop de fornecedores
+  FOR supplier IN
+    SELECT id, name
+    FROM public.suppliers
+    WHERE id = ANY(suppliers_to_process)
+      AND company_id = v_company_id
+  LOOP
+    BEGIN
+      -- Buscar contatos do fornecedor
+      SELECT array_agg(name || ' <' || email || '>') INTO supplier_contacts
+      FROM public.supplier_contacts
+      WHERE supplier_id = supplier.id
+        AND is_active = TRUE;
+
+      -- Pula se não houver contatos
+      IF supplier_contacts IS NULL OR array_length(supplier_contacts, 1) = 0 THEN
+        CONTINUE;
+      END IF;
+
+      -- Montar pedidos do fornecedor
+      orders_payload := '[]'::JSONB;
+
+      FOR orders IN
+        SELECT id, order_number, items
+          FROM (
+            SELECT 
+              o.id,
+              o.supplier_id,
+              o.order_number,
+              COALESCE(array_agg(oi.item_number), ARRAY[]::BIGINT[]) AS items
+            FROM public.orders o
+            JOIN public.default_order_status dos ON o.status_id = dos.id
+            LEFT JOIN public.order_items oi ON oi.order_id = o.id
+            WHERE o.company_id = v_company_id
+              AND dos.is_final = FALSE
+              AND (
+                (order_ids IS NOT NULL AND o.id = ANY(order_ids)) OR
+                (order_ids IS NULL)
+              )
+            GROUP BY o.supplier_id, o.order_number, o.id
+          ) orders_with_items
+          WHERE supplier_id = supplier.id
+      LOOP
+        orders_payload := orders_payload || jsonb_build_object(
+          'order_id', orders.id,
+          'order_number', orders.order_number,
+          'items', orders.items
+        );
+      END LOOP;
+
+      -- Montar bloco de payload do fornecedor
+      supplier_payload := jsonb_build_object(
+        'supplier_id',       supplier.id,
+        'supplier_contacts', to_jsonb(supplier_contacts),
+        'orders_payload',    orders_payload,
+        'user_observations', COALESCE(user_observations, ''),
+        'template_html',     html_template_final
+      );
+
+      payload := payload || jsonb_build_array(supplier_payload);
+
+    EXCEPTION
+      WHEN OTHERS THEN
+        PERFORM private.fn_log_process_event(
+          p_process_name  := 'send_followup_emails',
+          p_function_name := 'fn_send_payload_followup',
+          p_step          := 'supplier_payload',
+          p_status        := 'error',
+          p_message       := format('Erro ao montar payload para fornecedor %s (%s): %s', supplier.name, supplier.id, SQLERRM),
+          p_user_id       := v_uid,
+          p_metadata      := jsonb_build_object(
+                                'supplier_id', supplier.id,
+                                'company_id', v_company_id
+                              )
+        );
+        CONTINUE;
+    END;
+  END LOOP;
+  
+  IF jsonb_array_length(payload) = 0 THEN
+    PERFORM private.fn_log_process_event(
+      p_process_name  := 'send_followup_emails',
+      p_function_name := 'fn_send_payload_followup',
+      p_step          := 'empty_payload',
+      p_status        := 'warning',
+      p_message       := 'Nenhum payload válido foi gerado. Nenhum follow-up será enviado.',
+      p_user_id       := v_uid,
+      p_metadata      := jsonb_build_object(
+                            'company_id', v_company_id
+                          )
+    );
+    RETURN;
+  END IF;
+
+  PERFORM private.fn_log_process_event(
+    p_process_name  := 'send_followup_emails',
+    p_function_name := 'fn_send_payload_followup',
+    p_step          := 'build_payload',
+    p_status        := 'success',
+    p_message       := 'Payload de fornecedores montado com sucesso para envio de follow-up.',
+    p_user_id       := v_uid,
+    p_metadata      := jsonb_build_object(
+                          'total_fornecedores', jsonb_array_length(payload),
+                          'executado_para_company_id', v_company_id
+                      )
+  );
+  
+  BEGIN
+  -- Disparo do e-mail
+    PERFORM private.fn_send_followup_emails(payload);
+  EXCEPTION
+    WHEN OTHERS THEN
+      PERFORM private.fn_log_process_event(
+        p_process_name  := 'send_followup_emails',
+        p_function_name := 'fn_send_payload_followup',
+        p_step          := 'send_payload',
+        p_status        := 'error',
+        p_message       := format('Erro ao executar fn_send_followup_emails: %s', SQLERRM),
+        p_user_id       := v_uid,
+        p_metadata      := jsonb_build_object(
+                              'payload_parcial', payload,
+                              'company_id', v_company_id
+                            )
+      );
+  END;
+END;
+$$;
+
+
+-- Função para enviar e-mails de follow-up
+CREATE OR REPLACE FUNCTION private.fn_send_followup_emails(
+  supplier_payload JSONB,
+  in_company_id BIGINT DEFAULT NULL
+)
+RETURNS VOID
+SECURITY DEFINER
+SET search_path TO 'public', 'vault', 'private'
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  edge_token        TEXT;
+  service_role_key  TEXT;
+  supabase_url      TEXT;
+  endpoint          TEXT := 'send-followup';
+  -- variáveis do loop externo
+  entry             JSONB;
+  supplier_id       BIGINT;
+  supplier_contacts TEXT[];
+  template_html     TEXT;
+  orders_payload    JSONB;
+  user_observations TEXT;
+  -- variáveis do loop interno
+  supplier_contact  TEXT;
+  enriched_payload  JSONB;
+  supplier_contacts_slice TEXT[];
+  v_response JSONB;
+  -- sessão
+  v_uid             UUID := (select auth.uid());
+  v_user_id         UUID;
+  v_company_id      BIGINT;
+  v_is_active       BOOLEAN;
+  company_name      TEXT;
+BEGIN
+  SELECT decrypted_secret INTO edge_token
+    FROM vault.decrypted_secrets
+    WHERE name = 'INTERNAL_EDGE_TOKEN';
+
+  SELECT decrypted_secret INTO service_role_key
+    FROM vault.decrypted_secrets
+    WHERE name = 'SUPABASE_SERVICE_ROLE_KEY';
+
+  SELECT decrypted_secret INTO supabase_url
+    FROM vault.decrypted_secrets
+    WHERE name = 'SUPABASE_URL';
+
+  -- Sessão do usuário (se in_company_id não for passado)
+  IF in_company_id IS NULL THEN
+    SELECT uac.user_id, uac.company_id, uac.is_active
+    INTO v_user_id, v_company_id, v_is_active
+    FROM private.user_access_cache uac
+    WHERE uac.user_id = v_uid
+      AND uac.is_active = true
+      AND uac.role_name IN ('admin', 'comprador')
+    LIMIT 1;
+
+    IF NOT FOUND THEN
+      RAISE EXCEPTION 'Acesso negado: usuário % não tem registro ativo de acesso.', v_uid;
+    END IF;
+  ELSE
+    v_company_id := in_company_id;
+  END IF;
+
+  -- Nome da empresa
+  SELECT name INTO company_name
+    FROM public.companies
+    WHERE id = v_company_id;
+
+  -- Loop externo: para cada entry no JSON de fornecedores
+  FOR entry IN
+    SELECT * FROM jsonb_array_elements(supplier_payload)
+  LOOP
+    supplier_id       := (entry ->> 'supplier_id')::BIGINT;
+    template_html     := entry ->> 'template_html';
+    orders_payload    := entry -> 'orders_payload';
+    user_observations := entry ->> 'user_observations';
+
+    -- Converte JSON array para TEXT[]
+    supplier_contacts := ARRAY(
+      SELECT jsonb_array_elements_text(entry -> 'supplier_contacts')
+    );
+
+    -- quebra o array de contatos em batches de até 100
+    FOR i IN 1..CEIL(array_length(supplier_contacts, 1) / 100.0)::BIGINT LOOP
+      -- fatia os contatos
+      supplier_contacts_slice := supplier_contacts[
+        (i - 1) * 100 + 1 : LEAST(i * 100, array_length(supplier_contacts, 1))
+      ];
+
+      enriched_payload := jsonb_build_object(
+        'user_id',           v_user_id,
+        'supplier_id',       supplier_id,
+        'supplier_contacts', to_jsonb(supplier_contacts_slice),
+        'orders_payload',    orders_payload,
+        'company_id',        v_company_id,
+        'company_name',      company_name,
+        'user_observations', user_observations,
+        'template_html',     template_html
+      );
+
+      SELECT net.http_post(
+        url     := supabase_url || '/functions/v1/' || endpoint,
+        headers := jsonb_build_object(
+          'Content-Type',  'application/json',
+          'Authorization', 'Bearer ' || service_role_key,
+          'edge-token',    edge_token
+        ),
+        body    := jsonb_build_array(enriched_payload)
+      ) INTO v_response;
+
+      IF (v_response ->> 'status')::INT >= 400 THEN
+        PERFORM private.fn_log_process_event(
+          p_process_name  := 'send_followup_emails',
+          p_function_name := 'fn_send_followup_emails',
+          p_step          := 'edge_call',
+          p_status        := 'error',
+          p_message       := format('Erro ao enviar follow-up (status %s): %s', v_response ->> 'status', v_response ->> 'body'),
+          p_user_id       := v_user_id,
+          p_metadata      := jsonb_build_object(
+                                'contatos', supplier_contacts_slice,
+                                'payload', enriched_payload
+                              )
+        );
+        CONTINUE;
+      END IF;
+
+      PERFORM private.fn_log_process_event(
+        p_process_name  := 'send_followup_emails',
+        p_function_name := 'fn_send_followup_emails',
+        p_step          := 'edge_call',
+        p_status        := 'success',
+        p_message       := 'Follow-up enviado para batch de ' || array_length(supplier_contacts_slice, 1) || ' contatos',
+        p_user_id       := v_user_id,
+        p_metadata      := entry
+      );
+    END LOOP;
+  END LOOP;
+END;
+$$;
+
+
+-- Função para criar payload de e-mails de cancelamento de pedidos
+CREATE OR REPLACE FUNCTION public.fn_send_payload_order_cancel(
+    order_ids BIGINT[],
+    user_observations TEXT DEFAULT NULL,
+    template_html TEXT DEFAULT NULL
+)
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path TO 'public', 'private'
+AS $$
+DECLARE
+    order_info RECORD;
+    supplier_contacts TEXT[];
+    supplier_payloads JSONB[]; -- Array para múltiplos payloads
+    html_template_final TEXT;
+    v_company_id BIGINT;
+    v_uid UUID := (select auth.uid());
+    current_order_id BIGINT; -- Para iterar pelos IDs
+BEGIN
+    -- Captura company_id da sessão
+    SELECT uac.company_id INTO v_company_id
+    FROM private.user_access_cache uac
+    WHERE uac.user_id = v_uid
+      AND uac.is_active = true
+      AND uac.role_name IN ('admin', 'comprador')
+    LIMIT 1;
+
+    IF v_company_id IS NULL THEN
+        RAISE EXCEPTION 'Acesso negado: company_id não encontrado para o usuário % no cache de acesso.', v_uid;
+    ELSE
+        PERFORM set_config('request.source', 'client', true);
+        PERFORM set_config('request.user_id', v_uid::TEXT, true);
+    END IF;
+
+    -- Carrega o template, se não informado
+    IF template_html IS NULL THEN
+        SELECT email_template INTO html_template_final
+        FROM public.followup_settings
+        WHERE company_id = v_company_id
+          AND trigger_scope = 'manual_user_order_cancel'
+          AND is_active = TRUE
+        ORDER BY id DESC
+        LIMIT 1;
+
+        IF html_template_final IS NULL THEN
+            RAISE EXCEPTION 'Nenhum template configurado para cancelamento de pedidos (manual_user_order_cancel)';
+        END IF;
+    ELSE
+        html_template_final := template_html;
+    END IF;
+
+    -- Inicializa array de payloads
+    supplier_payloads := ARRAY[]::JSONB[];
+
+    -- Loop pelos order_ids
+    FOREACH current_order_id IN ARRAY order_ids
+    LOOP
+      BEGIN
+        -- Busca informações do pedido e fornecedor
+        SELECT 
+            o.id,
+            o.order_number,
+            o.order_description,
+            o.due_date,
+            dos.name as status_name,
+            s.id as supplier_id,
+            s.name as supplier_name
+        INTO order_info
+        FROM public.orders o
+        JOIN public.default_order_status dos ON o.status_id = dos.id
+        JOIN public.suppliers s ON o.supplier_id = s.id
+        WHERE o.id = current_order_id
+          AND o.company_id = v_company_id
+          AND s.company_id = v_company_id;
+
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'Pedido % não encontrado ou não pertence à empresa do usuário', current_order_id;
+        END IF;
+
+        -- Atualiza o status do pedido para 6 (cancelado)
+        UPDATE public.orders 
+        SET status_id = 6
+        WHERE id = current_order_id
+          AND company_id = v_company_id;
+
+        -- Buscar contatos do fornecedor
+        SELECT array_agg(name || ' <' || email || '>') INTO supplier_contacts
+        FROM public.supplier_contacts
+        WHERE supplier_id = order_info.supplier_id
+          AND is_active = TRUE;
+
+        -- Verifica se há contatos - SE NÃO HOUVER, APENAS CONTINUA PARA O PRÓXIMO PEDIDO
+        IF supplier_contacts IS NOT NULL AND array_length(supplier_contacts, 1) > 0 THEN
+            -- Adiciona payload ao array somente se houver contatos
+            supplier_payloads := supplier_payloads || jsonb_build_object(
+                'supplier_id', order_info.supplier_id,
+                'supplier_name', order_info.supplier_name,
+                'supplier_contacts', to_jsonb(supplier_contacts),
+                'order_info', jsonb_build_object(
+                    'order_id', order_info.id,
+                    'order_number', order_info.order_number,
+                    'order_description', COALESCE(order_info.order_description, ''),
+                    'due_date', order_info.due_date,
+                    'status_name', order_info.status_name
+                ),
+                'user_observations', COALESCE(user_observations, ''),
+                'template_html', html_template_final
+            );
+        END IF;
+        -- Se não houver contatos, simplesmente ignora e continua para o próximo pedido
+      EXCEPTION
+        WHEN OTHERS THEN
+          PERFORM private.fn_log_process_event(
+            p_process_name  := 'send_order_cancel_emails',
+            p_function_name := 'fn_send_payload_order_cancel',
+            p_step          := 'order_process',
+            p_status        := 'error',
+            p_message       := format('Erro ao processar pedido %s: %s', current_order_id, SQLERRM),
+            p_user_id       := v_uid,
+            p_metadata      := jsonb_build_object(
+                                  'order_id', current_order_id,
+                                  'company_id', v_company_id
+                                )
+          );
+          CONTINUE;
+      END;
+    END LOOP;
+
+    IF array_length(supplier_payloads, 1) = 0 THEN
+      PERFORM private.fn_log_process_event(
+        p_process_name  := 'send_order_cancel_emails',
+        p_function_name := 'fn_send_payload_order_cancel',
+        p_step          := 'empty_payload',
+        p_status        := 'warning',
+        p_message       := 'Nenhum payload de cancelamento foi gerado. Nenhum e-mail será enviado.',
+        p_user_id       := v_uid,
+        p_metadata      := jsonb_build_object(
+                              'company_id', v_company_id,
+                              'total_pedidos_recebidos', array_length(order_ids, 1)
+                            )
+      );
+      RETURN;
+    END IF;
+
+    BEGIN
+    -- Disparo dos e-mails (passa o array de payloads) - só se houver payloads
+    IF array_length(supplier_payloads, 1) > 0 THEN
+        PERFORM private.fn_send_order_cancel_emails(supplier_payloads);
+    END IF;
+    EXCEPTION
+      WHEN OTHERS THEN
+        PERFORM private.fn_log_process_event(
+          p_process_name  := 'send_order_cancel_emails',
+          p_function_name := 'fn_send_payload_order_cancel',
+          p_step          := 'send_payload',
+          p_status        := 'error',
+          p_message       := format('Erro ao executar fn_send_order_cancel_emails: %s', SQLERRM),
+          p_user_id       := v_uid,
+          p_metadata      := jsonb_build_object(
+                                'payload_parcial', supplier_payloads,
+                                'company_id', v_company_id
+                              )
+        );
+    END;
+END;
+$$;
+
+-- Função para enviar e-mails de cancelamento de pedidos (BULK)
+CREATE OR REPLACE FUNCTION private.fn_send_order_cancel_emails(
+    supplier_payloads JSONB[], 
+    in_company_id BIGINT DEFAULT NULL
+)
+RETURNS VOID
+SECURITY DEFINER
+SET search_path TO 'public', 'vault', 'private'
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    edge_token TEXT;
+    service_role_key TEXT;
+    supabase_url TEXT;
+    endpoint TEXT := 'send-order-cancel'; 
+    -- variáveis do fornecedor
+    supplier_payload JSONB; -- Para iterar pelos payloads
+    supplier_id BIGINT;
+    supplier_name TEXT;
+    supplier_contacts TEXT[];
+    template_html TEXT;
+    order_info JSONB;
+    user_observations TEXT;
+    -- variáveis do envio em lotes
+    enriched_payload JSONB;
+    supplier_contacts_slice TEXT[];
+    v_response JSONB;
+    -- sessão
+    v_uid UUID := (select auth.uid());
+    v_user_id UUID;
+    v_company_id BIGINT;
+    v_is_active BOOLEAN;
+    company_name TEXT;
+BEGIN
+    SELECT decrypted_secret INTO edge_token
+    FROM vault.decrypted_secrets
+    WHERE name = 'INTERNAL_EDGE_TOKEN';
+
+    SELECT decrypted_secret INTO service_role_key
+    FROM vault.decrypted_secrets
+    WHERE name = 'SUPABASE_SERVICE_ROLE_KEY';
+
+    SELECT decrypted_secret INTO supabase_url
+    FROM vault.decrypted_secrets
+    WHERE name = 'SUPABASE_URL';
+
+    -- Sessão do usuário (se in_company_id não for passado)
+    IF in_company_id IS NULL THEN
+        SELECT uac.user_id, uac.company_id, uac.is_active
+        INTO v_user_id, v_company_id, v_is_active
+        FROM private.user_access_cache uac
+        WHERE uac.user_id = v_uid
+          AND uac.is_active = true
+          AND uac.role_name IN ('admin', 'comprador')
+        LIMIT 1;
+
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'Acesso negado: usuário % não tem registro ativo de acesso.', v_uid;
+        END IF;
+    ELSE
+        v_company_id := in_company_id;
+    END IF;
+
+    -- Nome da empresa
+    SELECT name INTO company_name
+    FROM public.companies
+    WHERE id = v_company_id;
+
+    -- Loop pelos payloads (múltiplos pedidos)
+    FOREACH supplier_payload IN ARRAY supplier_payloads
+    LOOP
+        -- Extrai dados do payload atual
+        supplier_id := (supplier_payload ->> 'supplier_id')::BIGINT;
+        supplier_name := supplier_payload ->> 'supplier_name';
+        template_html := supplier_payload ->> 'template_html';
+        order_info := supplier_payload -> 'order_info';
+        user_observations := supplier_payload ->> 'user_observations';
+
+        -- Converte JSON array para TEXT[]
+        supplier_contacts := ARRAY(
+            SELECT jsonb_array_elements_text(supplier_payload -> 'supplier_contacts')
+        );
+
+        -- Envia emails em lotes de até 100 contatos por vez
+        FOR i IN 1..CEIL(array_length(supplier_contacts, 1) / 100.0)::BIGINT LOOP
+            -- fatia os contatos
+            supplier_contacts_slice := supplier_contacts[
+                (i - 1) * 100 + 1 : LEAST(i * 100, array_length(supplier_contacts, 1))
+            ];
+
+            enriched_payload := jsonb_build_object(
+                'user_id', v_user_id,
+                'supplier_id', supplier_id,
+                'supplier_name', supplier_name,
+                'supplier_contacts', to_jsonb(supplier_contacts_slice),
+                'order_info', order_info,
+                'company_id', v_company_id,
+                'company_name', company_name,
+                'user_observations', user_observations,
+                'template_html', template_html
+            );
+
+            SELECT net.http_post(
+                url := supabase_url || '/functions/v1/' || endpoint,
+                headers := jsonb_build_object(
+                    'Content-Type', 'application/json',
+                    'Authorization', 'Bearer ' || service_role_key,
+                    'edge-token', edge_token
+                ),
+                body := jsonb_build_array(enriched_payload)
+            ) INTO v_response;
+
+            IF (v_response ->> 'status')::INT >= 400 THEN
+              PERFORM private.fn_log_process_event(
+                p_process_name  := 'send_order_cancel_emails',
+                p_function_name := 'fn_send_order_cancel_emails',
+                p_step          := 'edge_call',
+                p_status        := 'error',
+                p_message       := format('Falha no envio do email de cancelamento para %s (pedido: %s): %s', supplier_name, order_info ->> 'order_number', v_response ->> 'body'),
+                p_user_id       := v_user_id,
+                p_metadata      := jsonb_build_object(
+                                      'contatos', supplier_contacts_slice,
+                                      'status', v_response ->> 'status'
+                                    )
+              );
+              CONTINUE;
+            END IF;
+
+            PERFORM private.fn_log_process_event(
+                p_process_name  := 'send_order_cancel_emails',
+                p_function_name := 'fn_send_order_cancel_emails',
+                p_step          := 'edge_call',
+                p_status        := 'success',
+                p_message       := 'Email de cancelamento enviado para ' || supplier_name || ' - batch de ' || array_length(supplier_contacts_slice, 1) || ' contatos (pedido: ' || (order_info ->> 'order_number') || ')',
+                p_user_id       := v_user_id,
+                p_metadata      := supplier_payload
+            );
+        END LOOP;
+    END LOOP;
+END;
+$$;
+
+
+-- ╭─────────────────────◉ CONTEXTO: Automações ◉──────────────────────╮
+-- ┃             Funções modulares de automação de followup             ┃
+-- ╰────────────────────────────────────────────────────────────────────╯
+
+-- Função modular por TRIGGER_SCOPE: default_order_status (Status de Pedido)
+CREATE OR REPLACE FUNCTION private.fn_get_targets_default_order_status(p_setting_id BIGINT)
+RETURNS TABLE (
+  supplier_id BIGINT,
+  order_ids BIGINT[]
+)
+SECURITY DEFINER
+SET search_path TO 'public', 'private'
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_company_id BIGINT;
+  v_status_id BIGINT;
+  v_max_followups INT;
+BEGIN
+  -- Buscar configurações da regra
+  SELECT fs.company_id, fs.trigger_reference_id, fs.max_followups
+  INTO v_company_id, v_status_id, v_max_followups
+  FROM public.followup_settings fs
+  WHERE fs.id = p_setting_id AND fs.is_active = true;
+
+
+  IF v_company_id IS NULL THEN
+      RETURN;
+  END IF;
+
+
+  -- Default para max_followups se não definido
+  v_max_followups := COALESCE(v_max_followups, 999);
+
+
+  RETURN QUERY
+  SELECT
+      o.supplier_id,
+      array_agg(o.id) as order_ids
+  FROM public.orders o
+  JOIN public.suppliers s ON s.id = o.supplier_id
+  JOIN public.default_order_status dos ON dos.id = o.status_id
+  WHERE o.company_id = v_company_id
+    AND (v_status_id IS NULL OR o.status_id = v_status_id)
+    AND dos.is_final = FALSE
+    AND EXISTS (
+        SELECT 1 FROM public.supplier_contacts sc
+        WHERE sc.supplier_id = o.supplier_id
+          AND sc.is_active = true
+    )
+
+    AND EXISTS (
+        SELECT 1 FROM public.order_items oi
+        LEFT JOIN private.followup_item_tracking fit ON (fit.order_item_id = oi.id AND fit.setting_id = p_setting_id)
+        WHERE oi.order_id = o.id
+          AND COALESCE(fit.followup_count, 0) < v_max_followups
+    )
+  GROUP BY o.supplier_id;
+END;
+$$;
+
+-- Função modular por TRIGGER_SCOPE: order_due_date (Data de Vencimento do Pedido)
+CREATE OR REPLACE FUNCTION private.fn_get_targets_order_due_date(p_setting_id BIGINT)
+RETURNS TABLE (
+  supplier_id BIGINT,
+  order_ids BIGINT[]
+)
+SECURITY DEFINER
+SET search_path TO 'public', 'private'
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_company_id BIGINT;
+  v_days_before INT;
+  v_max_followups INT;
+BEGIN
+  SELECT fs.company_id, fs.send_days_interval, fs.max_followups
+  INTO v_company_id, v_days_before, v_max_followups
+  FROM public.followup_settings fs
+  WHERE fs.id = p_setting_id AND fs.is_active = true;
+
+
+  IF v_company_id IS NULL THEN
+      RETURN;
+  END IF;
+
+
+  v_days_before := COALESCE(v_days_before, 3);
+  v_max_followups := COALESCE(v_max_followups, 999);
+
+
+  RETURN QUERY
+  SELECT
+      o.supplier_id,
+      array_agg(o.id) as order_ids
+  FROM public.orders o
+  JOIN public.suppliers s ON s.id = o.supplier_id
+  JOIN public.default_order_status dos ON dos.id = o.status_id
+  WHERE o.company_id = v_company_id
+    AND o.due_date IS NOT NULL
+    AND o.due_date <= (CURRENT_DATE + (v_days_before || ' days')::INTERVAL)
+    AND o.due_date >= CURRENT_DATE
+    AND dos.is_final = FALSE
+    AND EXISTS (
+        SELECT 1 FROM public.supplier_contacts sc
+        WHERE sc.supplier_id = o.supplier_id
+          AND sc.is_active = true
+    )
+
+    AND EXISTS (
+        SELECT 1 FROM public.order_items oi
+        LEFT JOIN private.followup_item_tracking fit ON (fit.order_item_id = oi.id AND fit.setting_id = p_setting_id)
+        WHERE oi.order_id = o.id
+          AND COALESCE(fit.followup_count, 0) < v_max_followups
+    )
+  GROUP BY o.supplier_id;
+END;
+$$;
+
+-- Função modular por TRIGGER_SCOPE: item_status (Status de item)
+CREATE OR REPLACE FUNCTION private.fn_get_targets_item_status(p_setting_id BIGINT)
+RETURNS TABLE (
+  supplier_id BIGINT,
+  order_ids BIGINT[]
+)
+SECURITY DEFINER
+SET search_path TO 'public', 'private'
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_company_id BIGINT;
+  v_status_id BIGINT;
+  v_max_followups INT;
+BEGIN
+  SELECT fs.company_id, fs.trigger_reference_id, fs.max_followups
+  INTO v_company_id, v_status_id, v_max_followups
+  FROM public.followup_settings fs
+  WHERE fs.id = p_setting_id AND fs.is_active = true;
+
+
+  IF v_company_id IS NULL THEN
+      RETURN;
+  END IF;
+
+
+  v_max_followups := COALESCE(v_max_followups, 999);
+
+
+  RETURN QUERY
+  SELECT
+      o.supplier_id,
+      array_agg(DISTINCT o.id) as order_ids
+  FROM public.orders o
+  JOIN public.order_items oi ON oi.order_id = o.id
+  JOIN public.suppliers s ON s.id = o.supplier_id
+  JOIN public.default_order_status dos ON dos.id = o.status_id
+  LEFT JOIN private.followup_item_tracking fit ON (fit.order_item_id = oi.id AND fit.setting_id = p_setting_id)
+  WHERE o.company_id = v_company_id
+    AND (v_status_id IS NULL OR oi.status_id = v_status_id)
+    AND dos.is_final = FALSE
+    AND EXISTS (
+        SELECT 1 FROM public.supplier_contacts sc
+        WHERE sc.supplier_id = o.supplier_id
+          AND sc.is_active = true
+    )
+
+    AND COALESCE(fit.followup_count, 0) < v_max_followups
+  GROUP BY o.supplier_id;
+END;
+$$;
+
+
+-- Função modular por TRIGGER_SCOPE: item_due_date (Data de Vencimento do Item)
+CREATE OR REPLACE FUNCTION private.fn_get_targets_item_due_date(p_setting_id BIGINT)
+RETURNS TABLE (
+  supplier_id BIGINT,
+  order_ids BIGINT[]
+)
+SECURITY DEFINER
+SET search_path TO 'public', 'private'
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_company_id BIGINT;
+  v_days_before INT;
+  v_max_followups INT;
+BEGIN
+  SELECT fs.company_id, fs.send_days_interval, fs.max_followups
+  INTO v_company_id, v_days_before, v_max_followups
+  FROM followup_settings fs
+  WHERE fs.id = p_setting_id AND fs.is_active = true;
+
+
+  IF v_company_id IS NULL THEN
+      RETURN;
+  END IF;
+
+
+  v_days_before := COALESCE(v_days_before, 3);
+  v_max_followups := COALESCE(v_max_followups, 999);
+
+
+  RETURN QUERY
+  SELECT
+      o.supplier_id,
+      array_agg(DISTINCT o.id) as order_ids
+  FROM public.orders o
+  JOIN public.order_items oi ON oi.order_id = o.id
+  JOIN public.suppliers s ON s.id = o.supplier_id
+  JOIN public.default_order_status dos ON dos.id = o.status_id
+  LEFT JOIN private.followup_item_tracking fit ON (fit.order_item_id = oi.id AND fit.setting_id = p_setting_id)
+  WHERE o.company_id = v_company_id
+    AND oi.due_date IS NOT NULL
+    AND oi.due_date <= (CURRENT_DATE + (v_days_before || ' days')::INTERVAL)
+    AND oi.due_date >= CURRENT_DATE
+    AND dos.is_final = FALSE
+    AND EXISTS (
+        SELECT 1 FROM public.supplier_contacts sc
+        WHERE sc.supplier_id = o.supplier_id
+          AND sc.is_active = true
+    )
+
+    AND COALESCE(fit.followup_count, 0) < v_max_followups
+  GROUP BY o.supplier_id;
+END;
+$$;
+
+-- Função modular por TRIGGER_SCOPE: item_delivery_date (Data de Entrega do Item)
+CREATE OR REPLACE FUNCTION private.fn_get_targets_item_delivery_date(p_setting_id BIGINT)
+RETURNS TABLE (
+  supplier_id BIGINT,
+  order_ids BIGINT[]
+)
+SECURITY DEFINER
+SET search_path TO 'public', 'private'
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_company_id BIGINT;
+  v_days_before INT;
+  v_max_followups INT;
+BEGIN
+  SELECT fs.company_id, fs.send_days_interval, fs.max_followups
+  INTO v_company_id, v_days_before, v_max_followups
+  FROM public.followup_settings fs
+  WHERE fs.id = p_setting_id AND fs.is_active = true;
+
+
+  IF v_company_id IS NULL THEN
+      RETURN;
+  END IF;
+
+
+  v_days_before := COALESCE(v_days_before, 3);
+  v_max_followups := COALESCE(v_max_followups, 999);
+
+
+  RETURN QUERY
+  SELECT
+      o.supplier_id,
+      array_agg(DISTINCT o.id) as order_ids
+  FROM public.orders o
+  JOIN public.order_items oi ON oi.order_id = o.id
+  JOIN public.suppliers s ON s.id = o.supplier_id
+  JOIN public.default_order_status dos ON dos.id = o.status_id
+  LEFT JOIN private.followup_item_tracking fit ON (fit.order_item_id = oi.id AND fit.setting_id = p_setting_id)
+  WHERE o.company_id = v_company_id
+    AND oi.current_delivery_date IS NOT NULL
+    AND oi.current_delivery_date <= (CURRENT_DATE + (v_days_before || ' days')::INTERVAL)
+    AND oi.current_delivery_date >= CURRENT_DATE
+    AND dos.is_final = FALSE
+    AND EXISTS (
+        SELECT 1 FROM public.supplier_contacts sc
+        WHERE sc.supplier_id = o.supplier_id
+          AND sc.is_active = true
+    )
+
+    AND COALESCE(fit.followup_count, 0) < v_max_followups
+  GROUP BY o.supplier_id;
+END;
+$$;
+
+-- Função executada pelo cron, para identificar regras elegíveis e popula a fila respeitando frequências.
+CREATE OR REPLACE FUNCTION private.fn_execute_scheduled_followups()
+RETURNS TABLE (
+  processed_rules INT,
+  queued_items INT,
+  skipped_rules INT
+)
+SECURITY DEFINER
+SET search_path TO 'public', 'private'
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  setting RECORD;
+  target RECORD;
+  v_processed_rules INT := 0;
+  v_queued_items INT := 0;
+  v_skipped_rules INT := 0;
+BEGIN
+  FOR setting IN
+      SELECT fs.*, c.name as company_name
+      FROM public.followup_settings fs
+      JOIN public.companies c ON c.id = fs.company_id
+      WHERE fs.is_active = true
+      ORDER BY fs.company_id, fs.id
+  LOOP
+      
+      -- Processar cada trigger_scope com suas funções específicas
+        IF setting.trigger_scope = 'default_order_status' THEN
+            FOR target IN SELECT * FROM private.fn_get_targets_default_order_status(setting.id) LOOP
+                PERFORM private.fn_queue_followup(setting.id, target.supplier_id, target.order_ids);
+                v_queued_items := v_queued_items + 1;
+            END LOOP;
+
+        ELSIF setting.trigger_scope = 'order_due_date' THEN
+            FOR target IN SELECT * FROM private.fn_get_targets_order_due_date(setting.id) LOOP
+                PERFORM private.fn_queue_followup(setting.id, target.supplier_id, target.order_ids);
+                v_queued_items := v_queued_items + 1;
+            END LOOP;
+
+        ELSIF setting.trigger_scope = 'item_status' THEN
+            FOR target IN SELECT * FROM private.fn_get_targets_item_status(setting.id) LOOP
+                PERFORM private.fn_queue_followup(setting.id, target.supplier_id, target.order_ids);
+                v_queued_items := v_queued_items + 1;
+            END LOOP;
+
+        ELSIF setting.trigger_scope = 'item_due_date' THEN
+            FOR target IN SELECT * FROM private.fn_get_targets_item_due_date(setting.id) LOOP
+                PERFORM private.fn_queue_followup(setting.id, target.supplier_id, target.order_ids);
+                v_queued_items := v_queued_items + 1;
+            END LOOP;
+
+        ELSIF setting.trigger_scope = 'item_delivery_date' THEN
+            FOR target IN SELECT * FROM private.fn_get_targets_item_delivery_date(setting.id) LOOP
+                PERFORM private.fn_queue_followup(setting.id, target.supplier_id, target.order_ids);
+                v_queued_items := v_queued_items + 1;
+            END LOOP;
+        END IF;
+
+      -- Atualizar timestamp da última execução
+      UPDATE public.followup_settings
+      SET last_sent_at = NOW()
+      WHERE id = setting.id;
+    
+      v_processed_rules := v_processed_rules + 1;
+  END LOOP;
+
+
+  RETURN QUERY SELECT v_processed_rules, v_queued_items, v_skipped_rules;
+END;
+$$;
+
+-- Função para evitar duplicação de itens na fila para o mesmo fornecedor/regra.
+CREATE OR REPLACE FUNCTION private.fn_queue_followup(
+    p_setting_id BIGINT,
+    p_supplier_id BIGINT,
+    p_order_ids BIGINT[]
+)
+RETURNS VOID
+SECURITY DEFINER
+SET search_path TO 'public', 'private'
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_company_id BIGINT;
+BEGIN
+    -- Buscar company_id do setting
+    SELECT company_id INTO v_company_id
+    FROM public.followup_settings
+    WHERE id = p_setting_id;
+
+    -- Inserir apenas se não existir pendente/enviando para este supplier+setting
+    INSERT INTO private.followup_queue (setting_id, supplier_id, company_id, order_ids, next_try_at)
+    SELECT p_setting_id, p_supplier_id, v_company_id, p_order_ids, NOW()
+    WHERE NOT EXISTS (
+        SELECT 1 FROM followup_queue
+        WHERE setting_id = p_setting_id
+        AND supplier_id = p_supplier_id
+        AND status IN ('pendente', 'enviando')
+    );
+END;
+$$;
+
+-- Função para processar fila com retry exponencial e controle de falhas.
+CREATE OR REPLACE FUNCTION private.fn_process_followup_queue(p_batch_size INT DEFAULT 50)
+RETURNS TABLE (
+  processed INT,
+  success INT,
+  failed INT,
+  retrying INT
+)
+SECURITY DEFINER
+SET search_path TO 'public', 'private'
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  q RECORD;
+  v_processed INT := 0;
+  v_success INT := 0;
+  v_failed INT := 0;
+  v_retrying INT := 0;
+  v_next_retry TIMESTAMP;
+BEGIN
+  FOR q IN
+      SELECT fq.*, fs.email_template, fs.max_followups
+      FROM private.followup_queue fq
+      JOIN public.followup_settings fs ON fs.id = fq.setting_id
+      WHERE fq.status IN ('pendente', 'falha')
+        AND (fq.next_try_at IS NULL OR fq.next_try_at <= NOW())
+        AND fq.tentativa < COALESCE(fq.max_tentativas, 3)
+      ORDER BY fq.created_at, fq.tentativa
+      LIMIT p_batch_size
+  LOOP
+      BEGIN
+          -- Marcar como enviando
+          UPDATE private.followup_queue
+          SET
+              status = 'enviando',
+              last_try_at = NOW(),
+              tentativa = tentativa + 1,
+              updated_at = NOW()
+          WHERE id = q.id;
+
+
+          -- Enviar follow-up usando função existente
+          PERFORM private.fn_send_payload_followup_cron(
+              p_company_id := q.company_id,
+              supplier_ids := ARRAY[q.supplier_id],
+              order_ids := q.order_ids,
+              template_html := q.email_template,
+              setting_id := q.setting_id
+          );
+
+
+          -- Atualizar contadores de follow-up por item
+          PERFORM private.fn_update_followup_counters(q.setting_id, q.order_ids);
+
+
+          -- Marcar como sucesso
+          UPDATE private.followup_queue
+          SET
+              status = 'sucesso',
+              updated_at = NOW(),
+              error_message = NULL
+          WHERE id = q.id;
+
+
+          v_success := v_success + 1;
+
+
+      EXCEPTION WHEN OTHERS THEN
+          -- Calcular próxima tentativa (backoff exponencial)
+          v_next_retry := NOW() + (POWER(2, q.tentativa) || ' minutes')::INTERVAL;
+
+
+          -- Verificar se excedeu máximo de tentativas
+          IF q.tentativa >= COALESCE(q.max_tentativas, 3) THEN
+              UPDATE followup_queue
+              SET
+                  status = 'falha',
+                  error_message = SQLERRM,
+                  updated_at = NOW()
+              WHERE id = q.id;
+              v_failed := v_failed + 1;
+          ELSE
+              UPDATE private.followup_queue
+              SET
+                  status = 'falha',
+                  next_try_at = v_next_retry,
+                  error_message = SQLERRM,
+                  updated_at = NOW()
+              WHERE id = q.id;
+              v_retrying := v_retrying + 1;
+          END IF;
+      END;
+
+
+      v_processed := v_processed + 1;
+  END LOOP;
+
+  RETURN QUERY SELECT v_processed, v_success, v_failed, v_retrying;
+END;
+$$;
+
+-- Função para manter a fila limpa removendo registros antigos.
+CREATE OR REPLACE FUNCTION private.fn_cleanup_followup_queue()
+RETURNS TABLE (
+    deleted_success INT,
+    deleted_failed INT,
+    total_deleted INT
+)
+SECURITY DEFINER
+SET search_path TO 'public', 'private'
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_deleted_success INT;
+    v_deleted_failed INT;
+BEGIN
+    -- Remove itens com sucesso (mais de 7 dias)
+    DELETE FROM private.followup_queue
+    WHERE status = 'sucesso'
+    AND updated_at < NOW() - INTERVAL '7 days';
+    
+    GET DIAGNOSTICS v_deleted_success = ROW_COUNT;
+    
+    -- Remove falhas definitivas antigas (mais de 30 dias)
+    DELETE FROM private.followup_queue
+    WHERE status = 'falha'
+    AND (next_try_at IS NULL OR tentativa >= max_tentativas)
+    AND updated_at < NOW() - INTERVAL '30 days';
+    
+    GET DIAGNOSTICS v_deleted_failed = ROW_COUNT;
+    
+    RETURN QUERY SELECT v_deleted_success, v_deleted_failed, (v_deleted_success + v_deleted_failed);
+END;
+$$;
+
+-- Função atualizar contadores após envio de followup
+CREATE OR REPLACE FUNCTION private.fn_update_followup_counters(
+  p_setting_id BIGINT,
+  p_order_ids BIGINT[]
+)
+RETURNS VOID
+SECURITY DEFINER
+SET search_path TO 'public', 'private'
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_company_id BIGINT;
+  v_supplier_id BIGINT;
+  pedido_id BIGINT;
+  item_record RECORD;
+BEGIN
+  -- Buscar company_id do setting
+  SELECT fs.company_id
+  INTO v_company_id
+  FROM public.followup_settings fs
+  WHERE fs.id = p_setting_id;
+
+  IF v_company_id IS NULL THEN
+      RETURN;
+  END IF;
+
+  -- Para cada pedido processado
+  FOREACH pedido_id IN ARRAY p_order_ids
+  LOOP
+      -- Buscar supplier_id do pedido
+      SELECT supplier_id INTO v_supplier_id
+      FROM public.orders
+      WHERE id = pedido_id;
+      
+      -- Atualizar contador para cada item do pedido
+      FOR item_record IN
+          SELECT oi.id as item_id, oi.order_id
+          FROM public.order_items oi
+          WHERE oi.order_id = pedido_id
+      LOOP
+          INSERT INTO private.followup_item_tracking (
+              order_id,
+              order_item_id,
+              setting_id,
+              supplier_id,
+              company_id,
+              followup_count,
+              last_followup_at
+          )
+          VALUES (
+              item_record.order_id,
+              item_record.item_id,
+              p_setting_id,
+              v_supplier_id,
+              v_company_id,
+              1,
+              NOW()
+          )
+          ON CONFLICT (order_item_id, setting_id)
+          DO UPDATE SET
+              followup_count = followup_item_tracking.followup_count + 1,
+              last_followup_at = NOW(),
+              updated_at = NOW();
+      END LOOP;
+  END LOOP;
+END;
+$$;
