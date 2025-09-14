@@ -49,10 +49,10 @@ SELECT cron.schedule(
 -- ┃                  Jobs de automações e followups                    ┃
 -- ╰────────────────────────────────────────────────────────────────────╯
 
--- Cron para identificar e enfileirar follow-ups agendados a cada hora
+-- Cron para identificar e enfileirar follow-ups agendados a cada minuto
 SELECT cron.schedule(
   'execute-scheduled-followups',
-  '0 * * * *',  -- Todo início de hora (UTC)
+  '* * * * *',  -- Todo início de hora (UTC)
   'SELECT private.fn_execute_scheduled_followups();'
 );
 

@@ -1183,6 +1183,25 @@ WITH CHECK (
   AND order_item_invoices.created_by = (select auth.uid())
 );
 
+CREATE POLICY insert_by_company_users
+ON public.order_item_invoices
+FOR INSERT
+TO authenticated
+WITH CHECK (
+  EXISTS (
+    SELECT 1
+    FROM private.user_access_cache uac
+    JOIN public.order_items oi ON oi.id = order_item_invoices.order_item_id
+    JOIN public.orders o ON o.id = oi.order_id
+    WHERE
+      uac.user_id = (select auth.uid())
+      AND uac.is_active = true
+      AND uac.role_name IN ('admin', 'comprador')
+      AND o.company_id = uac.company_id
+  )
+  AND order_item_invoices.created_by = (select auth.uid())
+);
+
 CREATE POLICY delete_by_suppliers
 ON public.order_item_invoices
 FOR DELETE
@@ -1341,6 +1360,63 @@ WITH CHECK (
   EXISTS (
     SELECT 1 FROM private.super_admins sa
     WHERE sa.id = (select auth.uid())
+  )
+);
+
+-- Política de acesso para fornecedores lerem notificações do comprador
+CREATE POLICY suppliers_can_read_client_notifications
+ON public.order_notifications
+FOR SELECT
+TO authenticated
+USING (
+  EXISTS (
+    SELECT 1
+    FROM private.user_access_cache uac
+    JOIN public.orders o ON o.id = order_notifications.order_id
+    WHERE
+      uac.user_id = (select auth.uid())
+      AND uac.is_active = true
+      AND uac.role_name = 'fornecedor'
+      AND o.supplier_id = uac.supplier_id
+      -- Só pode ver notificações do comprador (client_*)
+      AND order_notifications.type IN ('client_observation', 'client_status_change', 'client_item_change')
+  )
+);
+
+-- Política de acesso para fornecedores atualizarem notificações (marcar como lida)
+CREATE POLICY suppliers_can_update_client_notifications
+ON public.order_notifications
+FOR UPDATE
+TO authenticated
+USING (
+  EXISTS (
+    SELECT 1
+    FROM private.user_access_cache uac
+    JOIN public.orders o ON o.id = order_notifications.order_id
+    WHERE
+      uac.user_id = (select auth.uid())
+      AND uac.is_active = true
+      AND uac.role_name = 'fornecedor'
+      AND o.supplier_id = uac.supplier_id
+      -- Só pode atualizar notificações do comprador (client_*)
+      AND order_notifications.type IN ('client_observation', 'client_status_change', 'client_item_change')
+  )
+)
+WITH CHECK (
+  (
+    read_by IS NULL OR read_by = (select auth.uid())
+  ) AND
+  EXISTS (
+    SELECT 1
+    FROM private.user_access_cache uac
+    JOIN public.orders o ON o.id = order_notifications.order_id
+    WHERE
+      uac.user_id = (select auth.uid())
+      AND uac.is_active = true
+      AND uac.role_name = 'fornecedor'
+      AND o.supplier_id = uac.supplier_id
+      -- Só pode atualizar notificações do comprador (client_*)
+      AND order_notifications.type IN ('client_observation', 'client_status_change', 'client_item_change')
   )
 );
 

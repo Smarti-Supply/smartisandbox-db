@@ -302,9 +302,12 @@ BEGIN
     p_function_name := 'fn_delete_inactive_auth_users',
     p_step          := 'delete_users',
     p_status        := 'success',
-    p_message       := 'Execução de limpeza de usuários concluída.',
+    p_message       := format('%s usuários inativos removidos (signed_in: %s, never_signed_in: %s, inativos: %s).',
+                             v_deleted_signed_in + v_deleted_never_signed_in + v_deleted_inactive,
+                             v_deleted_signed_in, v_deleted_never_signed_in, v_deleted_inactive),
     p_user_id       := NULL,
     p_metadata      := jsonb_build_object(
+        'total_deletados', v_deleted_signed_in + v_deleted_never_signed_in + v_deleted_inactive,
         'deletados_signed_in', v_deleted_signed_in,
         'deletados_never_signed_in', v_deleted_never_signed_in,
         'deletados_inativos', v_deleted_inactive,
@@ -345,6 +348,8 @@ DECLARE
   record JSONB;
   supplier_id_resolved BIGINT;
   parsed_due_date DATE;
+  v_total_records INT;
+  v_processed_records INT := 0;
 BEGIN
   -- Obter o segredo do Vault
   SELECT decrypted_secret INTO expected_token
@@ -357,24 +362,27 @@ BEGIN
 
   PERFORM set_config('request.user_id', owner_id::TEXT, true);
 
-  -- Verifica se o campo company_id está presente
-  IF EXISTS (
-    SELECT 1
-    FROM jsonb_array_elements(payload) AS elem
-    WHERE NOT (elem ? 'company_id')
-  ) THEN
-    PERFORM private.fn_log_process_event(
-    p_process_name  := 'orders_upload',
-    p_function_name := 'fn_insert_orders',
-    p_step          := 'validate_payload',
-    p_status        := 'error',
-    p_message       := 'Registro(s) no payload sem company_id.',
-    p_user_id       := owner_id::uuid,
-    p_metadata      := payload
-  );
+  -- Obter total de registros
+  v_total_records := jsonb_array_length(payload);
 
-    RAISE EXCEPTION 'Algum registro no payload está sem company_id.';
-  END IF;
+  -- Verifica se o campo company_id está presente
+  FOR record IN SELECT * FROM jsonb_array_elements(payload)
+  LOOP
+    IF NOT (record ? 'company_id') THEN
+      PERFORM private.fn_log_process_event(
+        p_process_name  := 'orders_upload',
+        p_function_name := 'fn_insert_orders',
+        p_step          := 'validate_payload',
+        p_status        := 'error',
+        p_message       := format('company_id obrigatório para o Pedido (external_id: %s, order_number: %s).',
+                                  COALESCE(record->>'external_id', 'N/A'), 
+                                  COALESCE(record->>'order_number', 'N/A')),
+        p_user_id       := owner_id::uuid,
+        p_metadata      := record
+      );
+      RAISE EXCEPTION 'Algum registro no payload está sem company_id.';
+    END IF;
+  END LOOP;
 
   FOR record IN SELECT * FROM jsonb_array_elements(payload)
   LOOP
@@ -433,6 +441,8 @@ BEGIN
         ELSE orders.due_date
       END,
       updated_at = now();
+    
+    v_processed_records := v_processed_records + 1;
   END LOOP;
 
 PERFORM private.fn_log_process_event(
@@ -440,10 +450,12 @@ PERFORM private.fn_log_process_event(
   p_function_name := 'fn_insert_orders',
   p_step          := 'process_batch',
   p_status        := 'success',
-  p_message       := 'Lote de pedidos recebido e processado com sucesso.',
+  p_message       := format('Lote de %s pedidos teve %s pedidos processados com sucesso.',
+                           v_total_records, v_processed_records),
   p_user_id       := owner_id::uuid,
   p_metadata      := jsonb_build_object(
-                        'total_registros', jsonb_array_length(payload)
+                        'total_registros', v_total_records,
+                        'registros_processados', v_processed_records
                       )
 );
 END;
@@ -462,6 +474,10 @@ DECLARE
   record JSONB;
   processed_orders BIGINT[] := '{}';
   order_id_lookup BIGINT;
+  company_id_lookup BIGINT;
+  default_status_id BIGINT;
+  v_total_records INT;
+  v_processed_records INT := 0;
 BEGIN
   -- Validar token via Vault
   SELECT decrypted_secret INTO expected_token
@@ -474,31 +490,37 @@ BEGIN
 
   PERFORM set_config('request.user_id', owner_id::TEXT, true);
 
-  -- Verifica se o campo company_id está presente
-  IF EXISTS (
-    SELECT 1
-    FROM jsonb_array_elements(payload) AS elem
-    WHERE NOT (elem ? 'company_id')
-  ) THEN
-    PERFORM private.fn_log_process_event(
-    p_process_name  := 'orders_upload',
-    p_function_name := 'fn_insert_order_items',
-    p_step          := 'validate_payload',
-    p_status        := 'error',
-    p_message       := 'Registro(s) no payload sem company_id.',
-    p_user_id       := owner_id::uuid,
-    p_metadata      := payload
-  );
+  -- Obter total de registros
+  v_total_records := jsonb_array_length(payload);
 
-    RAISE EXCEPTION 'Algum registro no payload está sem company_id.';
-  END IF;
+  -- Verifica se o campo company_id está presente
+  FOR record IN SELECT * FROM jsonb_array_elements(payload)
+  LOOP
+    IF NOT (record ? 'company_id') THEN
+      PERFORM private.fn_log_process_event(
+        p_process_name  := 'orders_upload',
+        p_function_name := 'fn_insert_order_items',
+        p_step          := 'validate_payload',
+        p_status        := 'error',
+        p_message       := format('company_id obrigatório para o Item (item_number: %s, order_number: %s).',
+                                  COALESCE(record->>'item_number', 'N/A'), 
+                                  COALESCE(record->>'order_number', 'N/A')),
+        p_user_id       := owner_id::uuid,
+        p_metadata      := record
+      );
+      RAISE EXCEPTION 'Algum registro no payload está sem company_id.';
+    END IF;
+  END LOOP;
 
   FOR record IN SELECT * FROM jsonb_array_elements(payload)
   LOOP
+    -- Extrair company_id para usar na busca
+    company_id_lookup := (record->>'company_id')::BIGINT;
+    
     -- Buscar order_id via order_number
     SELECT id INTO order_id_lookup
     FROM public.orders
-    WHERE company_id = (record->>'company_id')::BIGINT
+    WHERE company_id = company_id_lookup
     AND order_number = record->>'order_number';
 
     IF order_id_lookup IS NULL THEN
@@ -513,6 +535,29 @@ BEGIN
         p_metadata      := record
       );
       CONTINUE;
+    END IF;
+
+    -- Buscar o status padrão da empresa (position = 1) para order_items importados
+    SELECT id INTO default_status_id
+    FROM public.order_item_status
+    WHERE company_id = company_id_lookup
+    AND position = 1
+    ORDER BY position ASC
+    LIMIT 1;
+
+    -- Log se não encontrou status padrão para a empresa
+    IF default_status_id IS NULL THEN
+      PERFORM private.fn_log_process_event(
+        p_process_name  := 'orders_upload',
+        p_function_name := 'fn_insert_order_items',
+        p_step          := 'get_default_status',
+        p_status        := 'error',
+        p_message       := format('Status padrão não encontrado para empresa %s (company_id: %s). Item será criado sem status_id.',
+                                  COALESCE((SELECT name FROM public.companies WHERE id = company_id_lookup), 'N/A'),
+                                  company_id_lookup),
+        p_user_id       := owner_id::uuid,
+        p_metadata      := record
+      );
     END IF;
 
     INSERT INTO public.order_items (
@@ -543,7 +588,8 @@ BEGIN
       record->>'plant',
       (record->>'due_date')::DATE,
       (record->>'current_delivery_date')::DATE,
-      (record->>'status_id')::BIGINT,
+      -- Usar status padrão da empresa (position=1) quando não especificado ou NULL
+      COALESCE((record->>'status_id')::BIGINT, default_status_id),
       record->>'bidding_description',         -- Campo customizado para Transpetro
       (record->>'custom_deliver_time')::INT,  -- Campo customizado para Transpetro
       (record->>'purchase_req')::BIGINT,      -- Campo customizado para Transpetro
@@ -558,7 +604,12 @@ BEGIN
       unit_price = CASE WHEN record ? 'unit_price' THEN (record->>'unit_price')::NUMERIC ELSE order_items.unit_price END,
       plant = CASE WHEN record ? 'plant' THEN record->>'plant' ELSE order_items.plant END,
       due_date = CASE WHEN record ? 'due_date' THEN (record->>'due_date')::DATE ELSE order_items.due_date END,
-      status_id = CASE WHEN record ? 'status_id' THEN (record->>'status_id')::BIGINT ELSE order_items.status_id END,
+      -- Para atualizações, usar status do payload se fornecido, senão usar status padrão se o atual for NULL
+      status_id = CASE 
+        WHEN record ? 'status_id' THEN COALESCE((record->>'status_id')::BIGINT, default_status_id)
+        WHEN order_items.status_id IS NULL THEN default_status_id
+        ELSE order_items.status_id 
+      END,
       bidding_description = CASE WHEN record ? 'bidding_description' THEN record->>'bidding_description' ELSE order_items.bidding_description END,        -- Campo customizado para Transpetro
       custom_deliver_time = CASE WHEN record ? 'custom_deliver_time' THEN (record->>'custom_deliver_time')::INT ELSE order_items.custom_deliver_time END, -- Campo customizado para Transpetro
       purchase_req = CASE WHEN record ? 'purchase_req' THEN (record->>'purchase_req')::BIGINT ELSE order_items.purchase_req END,                          -- Campo customizado para Transpetro
@@ -568,6 +619,8 @@ BEGIN
     IF NOT (processed_orders @> ARRAY[order_id_lookup]) THEN
       processed_orders := array_append(processed_orders, order_id_lookup);
     END IF;
+    
+    v_processed_records := v_processed_records + 1;
   END LOOP;
 
   -- Atualiza due_date nos pedidos que ainda não possuem valor
@@ -585,10 +638,12 @@ PERFORM private.fn_log_process_event(
   p_function_name := 'fn_insert_order_items',
   p_step          := 'process_batch',
   p_status        := 'success',
-  p_message       := 'Lote de itens de pedidos recebido e processado com sucesso.',
+  p_message       := format('Lote de %s itens teve %s itens processados com sucesso.',
+                           v_total_records, v_processed_records),
   p_user_id       := owner_id::uuid,
   p_metadata      := jsonb_build_object(
-                        'total_registros', jsonb_array_length(payload),
+                        'total_registros', v_total_records,
+                        'registros_processados', v_processed_records,
                         'pedidos_processados', processed_orders
                       )
 );
@@ -606,6 +661,8 @@ AS $$
 DECLARE
   expected_token TEXT;
   record JSONB;
+  v_total_records INT;
+  v_processed_records INT := 0;
 BEGIN
   -- Obter o segredo do Vault
   SELECT decrypted_secret INTO expected_token
@@ -619,23 +676,27 @@ BEGIN
 
   PERFORM set_config('request.user_id', owner_id::TEXT, true);
 
+  -- Obter total de registros
+  v_total_records := jsonb_array_length(payload);
+
   -- Verifica se o campo company_id está presente
-  IF EXISTS (
-    SELECT 1
-    FROM jsonb_array_elements(payload) AS elem
-    WHERE NOT (elem ? 'company_id')
-  ) THEN
-    PERFORM private.fn_log_process_event(
-    p_process_name  := 'suppliers_upload',
-    p_function_name := 'fn_insert_suppliers',
-    p_step          := 'validate_payload',
-    p_status        := 'error',
-    p_message       := 'Registro(s) no payload sem company_id.',
-    p_user_id       := owner_id::uuid,
-    p_metadata      := payload
-  );
-    RAISE EXCEPTION 'Algum registro no payload está sem company_id.';
-  END IF;
+  FOR record IN SELECT * FROM jsonb_array_elements(payload)
+  LOOP
+    IF NOT (record ? 'company_id') THEN
+      PERFORM private.fn_log_process_event(
+        p_process_name  := 'suppliers_upload',
+        p_function_name := 'fn_insert_suppliers',
+        p_step          := 'validate_payload',
+        p_status        := 'error',
+        p_message       := format('company_id obrigatório para o Fornecedor (cnpj: %s, external_id: %s).',
+                                  COALESCE(record->>'cnpj', 'N/A'), 
+                                  COALESCE(record->>'external_id', 'N/A')),
+        p_user_id       := owner_id::uuid,
+        p_metadata      := record
+      );
+      RAISE EXCEPTION 'Algum registro no payload está sem company_id.';
+    END IF;
+  END LOOP;
 
   -- Iterar sobre os registros do payload
   FOR record IN SELECT * FROM jsonb_array_elements(payload)
@@ -758,6 +819,9 @@ BEGIN
         );
         CONTINUE;
     END;
+    
+    -- Incrementar contador de registros processados com sucesso
+    v_processed_records := v_processed_records + 1;
   END LOOP;
 
 PERFORM private.fn_log_process_event(
@@ -765,10 +829,12 @@ PERFORM private.fn_log_process_event(
   p_function_name := 'fn_insert_suppliers',
   p_step          := 'process_batch',
   p_status        := 'success',
-  p_message       := 'Lote de fornecedores recebido e processado com sucesso.',
+  p_message       := format('Lote de %s fornecedores teve %s fornecedores processados com sucesso.',
+                           v_total_records, v_processed_records),
   p_user_id       := owner_id::uuid,
   p_metadata      := jsonb_build_object(
-                        'total_registros', jsonb_array_length(payload)
+                        'total_registros', v_total_records,
+                        'registros_processados', v_processed_records
                       )
 );
 END;
@@ -786,6 +852,8 @@ DECLARE
   expected_token TEXT;
   record JSONB;
   supplier_id_resolved BIGINT;
+  v_total_records INT;
+  v_processed_records INT := 0;
 BEGIN
   -- Obter o segredo do Vault
   SELECT decrypted_secret INTO expected_token
@@ -799,23 +867,27 @@ BEGIN
 
   PERFORM set_config('request.user_id', owner_id::TEXT, true);
 
+  -- Obter total de registros
+  v_total_records := jsonb_array_length(payload);
+
   -- Verifica se o campo company_id está presente
-  IF EXISTS (
-    SELECT 1
-    FROM jsonb_array_elements(payload) AS elem
-    WHERE NOT (elem ? 'company_id')
-  ) THEN
-    PERFORM private.fn_log_process_event(
-    p_process_name  := 'suppliers_upload',
-    p_function_name := 'fn_insert_supplier_contacts',
-    p_step          := 'validate_payload',
-    p_status        := 'error',
-    p_message       := 'Registro(s) no payload sem company_id.',
-    p_user_id       := owner_id::uuid,
-    p_metadata      := payload
-  );
-    RAISE EXCEPTION 'Algum registro no payload está sem company_id.';
-  END IF;
+  FOR record IN SELECT * FROM jsonb_array_elements(payload)
+  LOOP
+    IF NOT (record ? 'company_id') THEN
+      PERFORM private.fn_log_process_event(
+        p_process_name  := 'suppliers_upload',
+        p_function_name := 'fn_insert_supplier_contacts',
+        p_step          := 'validate_payload',
+        p_status        := 'error',
+        p_message       := format('company_id obrigatório para o Contato (email: %s, external_id: %s).',
+                                  COALESCE(record->>'email', 'N/A'), 
+                                  COALESCE(record->>'external_id', 'N/A')),
+        p_user_id       := owner_id::uuid,
+        p_metadata      := record
+      );
+      RAISE EXCEPTION 'Algum registro no payload está sem company_id.';
+    END IF;
+  END LOOP;
 
   -- Iterar sobre os registros do payload
   FOR record IN SELECT * FROM jsonb_array_elements(payload)
@@ -858,6 +930,8 @@ BEGIN
     SET
       name = EXCLUDED.name,
       phone = EXCLUDED.phone;
+    
+    v_processed_records := v_processed_records + 1;
   END LOOP;
 
 PERFORM private.fn_log_process_event(
@@ -865,10 +939,12 @@ PERFORM private.fn_log_process_event(
   p_function_name := 'fn_insert_supplier_contacts',
   p_step          := 'process_batch',
   p_status        := 'success',
-  p_message       := 'Lote de contatos de fornecedores recebido e processado com sucesso.',
+  p_message       := format('Lote de %s contatos teve %s contatos processados com sucesso.',
+                           v_total_records, v_processed_records),
   p_user_id       := owner_id::uuid,
   p_metadata      := jsonb_build_object(
-                        'total_registros', jsonb_array_length(payload)
+                        'total_registros', v_total_records,
+                        'registros_processados', v_processed_records
                       )
 );
 END;
@@ -924,6 +1000,7 @@ BEGIN
 
         PERFORM set_config('request.source', 'supplier', true);
         PERFORM set_config('request.supplier_contact_id', v_supplier_contact_id::TEXT, true);
+        PERFORM set_config('request.user_id', v_uid::TEXT, true);
 
     ELSE
         RAISE EXCEPTION 'Acesso negado: usuário % não possui permissão para atualizar pedidos.', v_uid;
@@ -1015,6 +1092,7 @@ BEGIN
 
         PERFORM set_config('request.source', 'supplier', true);
         PERFORM set_config('request.supplier_contact_id', v_supplier_contact_id::TEXT, true);
+        PERFORM set_config('request.user_id', v_uid::TEXT, true);
     ELSE
         RAISE EXCEPTION 'Acesso negado: usuário % não possui permissão para atualizar pedidos.', v_uid;
     END IF;
@@ -1090,21 +1168,21 @@ BEGIN
         RAISE EXCEPTION 'Usuário % não encontrado ou sem acesso.', v_uid;
     END IF;
 
-    -- Verifica se item pertence a algum pedido (proteção contra inserção fantasiosa)
-    SELECT EXISTS (
-        SELECT 1
-        FROM public.order_items oi
-        JOIN public.orders o ON o.id = oi.order_id
-        WHERE oi.id = p_order_item_id
-          AND o.supplier_id = v_supplier_id
-    ) INTO v_order_item_exists;
-
-    IF NOT v_order_item_exists THEN
-        RAISE EXCEPTION 'Item de pedido % não encontrado ou não pertence ao fornecedor.', p_order_item_id;
-    END IF;
-
-    -- Fornecedor
+    -- Verifica se item pertence a algum pedido e se o usuário tem acesso
     IF v_role_name = 'fornecedor' THEN
+        -- Para fornecedores: verifica se o item pertence ao fornecedor
+        SELECT EXISTS (
+            SELECT 1
+            FROM public.order_items oi
+            JOIN public.orders o ON o.id = oi.order_id
+            WHERE oi.id = p_order_item_id
+              AND o.supplier_id = v_supplier_id
+        ) INTO v_order_item_exists;
+
+        IF NOT v_order_item_exists THEN
+            RAISE EXCEPTION 'Item de pedido % não encontrado ou não pertence ao fornecedor.', p_order_item_id;
+        END IF;
+
         SELECT sc.id
         INTO v_supplier_contact_id
         FROM public.supplier_contacts sc
@@ -1115,6 +1193,27 @@ BEGIN
 
         PERFORM set_config('request.source', 'supplier', true);
         PERFORM set_config('request.supplier_contact_id', v_supplier_contact_id::TEXT, true);
+        PERFORM set_config('request.user_id', v_uid::TEXT, true);
+
+    ELSIF v_role_name IN ('admin', 'comprador') THEN
+        -- Para compradores/admin: verifica se o item pertence à empresa
+        SELECT EXISTS (
+            SELECT 1
+            FROM public.order_items oi
+            JOIN public.orders o ON o.id = oi.order_id
+            JOIN private.user_access_cache uac ON uac.company_id = o.company_id
+            WHERE oi.id = p_order_item_id
+              AND uac.user_id = v_uid
+              AND uac.is_active = true
+        ) INTO v_order_item_exists;
+
+        IF NOT v_order_item_exists THEN
+            RAISE EXCEPTION 'Item de pedido % não encontrado ou não pertence à empresa.', p_order_item_id;
+        END IF;
+
+        PERFORM set_config('request.source', 'client', true);
+        PERFORM set_config('request.user_id', v_uid::TEXT, true);
+
     ELSE
         RAISE EXCEPTION 'Acesso negado: usuário % não tem permissão para inserir faturamentos.', v_uid;
     END IF;
@@ -1219,6 +1318,235 @@ BEGIN
 END;
 $$;
 
+-- Função para inserir observações do comprador
+CREATE OR REPLACE FUNCTION public.fn_insert_client_observations(
+    p_order_id BIGINT,
+    p_user_observations TEXT,
+    p_created_by UUID,
+    p_order_item_id BIGINT DEFAULT NULL
+)
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path TO 'public', 'private'
+AS $$
+DECLARE
+    v_uid UUID := (select auth.uid());
+    v_company_id BIGINT;
+    v_role_name TEXT;
+    v_order_company_id BIGINT;
+    v_order_number TEXT;
+    v_item_number BIGINT;
+BEGIN
+    -- Captura company_id da sessão
+    SELECT uac.company_id, uac.role_name
+    INTO v_company_id, v_role_name
+    FROM private.user_access_cache uac
+    WHERE uac.user_id = v_uid
+      AND uac.is_active = true
+    LIMIT 1;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Usuário % não encontrado ou sem acesso.', v_uid;
+    END IF;
+
+    -- Verifica se o usuário tem role 'admin' ou 'comprador'
+    IF v_role_name NOT IN ('admin', 'comprador') THEN
+        RAISE EXCEPTION 'Acesso negado: apenas usuários com role "admin" ou "comprador" podem inserir observações.';
+    END IF;
+
+    -- Verifica se o pedido existe e pertence à empresa do usuário
+    SELECT company_id, order_number
+    INTO v_order_company_id, v_order_number
+    FROM public.orders
+    WHERE id = p_order_id;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Pedido % não encontrado.', p_order_id;
+    END IF;
+
+    IF v_order_company_id <> v_company_id THEN
+        RAISE EXCEPTION 'Acesso negado: pedido % não pertence à empresa do usuário.', p_order_id;
+    END IF;
+
+    -- Se order_item_id foi fornecido, verifica se existe
+    IF p_order_item_id IS NOT NULL THEN
+        SELECT item_number INTO v_item_number
+        FROM public.order_items
+        WHERE id = p_order_item_id AND order_id = p_order_id;
+
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'Item % não encontrado no pedido %.', p_order_item_id, p_order_id;
+        END IF;
+    END IF;
+
+    -- Define variáveis de contexto para o trigger
+    PERFORM set_config('request.source', 'client', true);
+    PERFORM set_config('request.user_id', v_uid::TEXT, true);
+
+    -- Insere a observação na tabela
+    INSERT INTO public.order_and_item_observations (
+        order_id,
+        order_item_id,
+        user_observations,
+        created_by
+    ) VALUES (
+        p_order_id,
+        p_order_item_id,
+        p_user_observations,
+        p_created_by
+    );
+
+END;
+$$;
+
+-- Função para atualizar status de pedido pelo comprador
+CREATE OR REPLACE FUNCTION public.fn_update_order_status_by_client(
+    p_order_id BIGINT,
+    p_status_id INT
+)
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path TO 'public', 'private'
+AS $$
+DECLARE
+    v_uid UUID := (select auth.uid());
+    v_company_id BIGINT;
+    v_role_name TEXT;
+BEGIN
+    -- Captura company_id da sessão
+    SELECT uac.company_id, uac.role_name
+    INTO v_company_id, v_role_name
+    FROM private.user_access_cache uac
+    WHERE uac.user_id = v_uid
+      AND uac.is_active = true
+    LIMIT 1;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Usuário % não encontrado ou sem acesso.', v_uid;
+    END IF;
+
+    -- Verifica se o usuário tem role 'admin' ou 'comprador'
+    IF v_role_name NOT IN ('admin', 'comprador') THEN
+        RAISE EXCEPTION 'Acesso negado: apenas usuários com role "admin" ou "comprador" podem atualizar status de pedidos.';
+    END IF;
+
+    -- Define variáveis de contexto para o trigger
+    PERFORM set_config('request.source', 'client', true);
+    PERFORM set_config('request.user_id', v_uid::TEXT, true);
+
+    -- Atualiza o status do pedido
+    UPDATE public.orders
+    SET status_id = p_status_id
+    WHERE id = p_order_id
+      AND company_id = v_company_id
+      AND status_id IS DISTINCT FROM p_status_id;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Pedido % não encontrado ou acesso negado.', p_order_id;
+    END IF;
+END;
+$$;
+
+-- Função para atualizar campos de itens pelo comprador
+CREATE OR REPLACE FUNCTION public.fn_update_order_items_by_client(
+    p_order_id BIGINT,
+    p_order_item_id BIGINT,
+    p_status_id BIGINT DEFAULT NULL,
+    p_due_date DATE DEFAULT NULL,
+    p_current_delivery_date DATE DEFAULT NULL
+)
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path TO 'public', 'private'
+AS $$
+DECLARE
+    v_uid UUID := (SELECT auth.uid());
+    v_company_id BIGINT;
+    v_role_name TEXT;
+BEGIN
+    IF p_status_id IS NULL AND p_due_date IS NULL AND p_current_delivery_date IS NULL THEN
+        RAISE EXCEPTION 'Pelo menos um dos parâmetros deve ser fornecido.';
+    END IF;
+
+    -- Captura sessão do usuário
+    SELECT uac.company_id, uac.role_name
+    INTO v_company_id, v_role_name
+    FROM private.user_access_cache uac
+    WHERE uac.user_id = v_uid
+      AND uac.is_active = true
+    LIMIT 1;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Usuário % não encontrado ou sem acesso.', v_uid;
+    END IF;
+
+    -- Verifica se o usuário tem role 'admin' ou 'comprador'
+    IF v_role_name NOT IN ('admin', 'comprador') THEN
+        RAISE EXCEPTION 'Acesso negado: apenas usuários com role "admin" ou "comprador" podem atualizar itens de pedidos.';
+    END IF;
+
+    -- Define variáveis de contexto para o trigger
+    PERFORM set_config('request.source', 'client', true);
+    PERFORM set_config('request.user_id', v_uid::TEXT, true);
+
+    -- Atualiza apenas os campos informados
+    IF p_status_id IS NOT NULL AND p_due_date IS NOT NULL AND p_current_delivery_date IS NOT NULL THEN
+        UPDATE public.order_items
+        SET status_id = p_status_id,
+            due_date = p_due_date,
+            current_delivery_date = p_current_delivery_date
+        WHERE id = p_order_item_id
+          AND order_id = p_order_id;
+
+    ELSIF p_status_id IS NOT NULL AND p_due_date IS NOT NULL THEN
+        UPDATE public.order_items
+        SET status_id = p_status_id,
+            due_date = p_due_date
+        WHERE id = p_order_item_id
+          AND order_id = p_order_id;
+
+    ELSIF p_status_id IS NOT NULL AND p_current_delivery_date IS NOT NULL THEN
+        UPDATE public.order_items
+        SET status_id = p_status_id,
+            current_delivery_date = p_current_delivery_date
+        WHERE id = p_order_item_id
+          AND order_id = p_order_id;
+
+    ELSIF p_due_date IS NOT NULL AND p_current_delivery_date IS NOT NULL THEN
+        UPDATE public.order_items
+        SET due_date = p_due_date,
+            current_delivery_date = p_current_delivery_date
+        WHERE id = p_order_item_id
+          AND order_id = p_order_id;
+
+    ELSIF p_status_id IS NOT NULL THEN
+        UPDATE public.order_items
+        SET status_id = p_status_id
+        WHERE id = p_order_item_id
+          AND order_id = p_order_id;
+
+    ELSIF p_due_date IS NOT NULL THEN
+        UPDATE public.order_items
+        SET due_date = p_due_date
+        WHERE id = p_order_item_id
+          AND order_id = p_order_id;
+
+    ELSIF p_current_delivery_date IS NOT NULL THEN
+        UPDATE public.order_items
+        SET current_delivery_date = p_current_delivery_date
+        WHERE id = p_order_item_id
+          AND order_id = p_order_id;
+    END IF;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Item % do Pedido % não encontrado ou acesso negado.', p_order_item_id, p_order_id;
+    END IF;
+END;
+$$;
+
 -- ╭─────────────────◉ CONTEXTO: Envio de Emails ◉─────────────────────╮
 -- ┃                   Funções de envio de emails                       ┃
 -- ╰────────────────────────────────────────────────────────────────────╯
@@ -1276,15 +1604,81 @@ BEGIN
         JOIN public.default_order_status dos ON o.status_id = dos.id
         WHERE o.company_id = p_company_id
         AND o.id = ANY(order_ids)
-        AND dos.is_final = FALSE;
+        AND (
+          -- Se todos os itens são finais, nunca envia followup
+          NOT EXISTS (
+            SELECT 1 FROM public.order_items oi
+            JOIN public.order_item_status ois ON oi.status_id = ois.id
+            WHERE oi.order_id = o.id AND ois.is_final = FALSE
+          )
+          OR
+          -- Se tem itens não finais, verifica o status do pedido
+          (
+            EXISTS (
+              SELECT 1 FROM public.order_items oi
+              JOIN public.order_item_status ois ON oi.status_id = ois.id
+              WHERE oi.order_id = o.id AND ois.is_final = FALSE
+            )
+            AND (
+              (dos.is_final = FALSE AND dos.code != 'concluido')
+              OR (dos.code = 'concluido')
+            )
+          )
+        );
     ELSIF supplier_ids IS NOT NULL AND array_length(supplier_ids, 1) IS NOT NULL THEN
-        suppliers_to_process := supplier_ids;
+        -- Aplicar filtro mesmo quando supplier_ids é fornecido
+        SELECT array_agg(DISTINCT o.supplier_id) INTO suppliers_to_process
+        FROM public.orders o
+        JOIN public.default_order_status dos ON o.status_id = dos.id
+        WHERE o.company_id = p_company_id
+          AND o.supplier_id = ANY(supplier_ids)
+          AND (
+            -- Se todos os itens são finais, nunca envia followup
+            NOT EXISTS (
+              SELECT 1 FROM public.order_items oi
+              JOIN public.order_item_status ois ON oi.status_id = ois.id
+              WHERE oi.order_id = o.id AND ois.is_final = FALSE
+            )
+            OR
+            -- Se tem itens não finais, verifica o status do pedido
+            (
+              EXISTS (
+                SELECT 1 FROM public.order_items oi
+                JOIN public.order_item_status ois ON oi.status_id = ois.id
+                WHERE oi.order_id = o.id AND ois.is_final = FALSE
+              )
+              AND (
+                (dos.is_final = FALSE AND dos.code != 'concluido')
+                OR (dos.code = 'concluido')
+              )
+            )
+          );
     ELSE
         SELECT array_agg(DISTINCT supplier_id) INTO suppliers_to_process
         FROM public.orders o
         JOIN public.default_order_status dos ON o.status_id = dos.id
         WHERE o.company_id = p_company_id
-        AND dos.is_final = FALSE;
+        AND (
+          -- Se todos os itens são finais, nunca envia followup
+          NOT EXISTS (
+            SELECT 1 FROM public.order_items oi
+            JOIN public.order_item_status ois ON oi.status_id = ois.id
+            WHERE oi.order_id = o.id AND ois.is_final = FALSE
+          )
+          OR
+          -- Se tem itens não finais, verifica o status do pedido
+          (
+            EXISTS (
+              SELECT 1 FROM public.order_items oi
+              JOIN public.order_item_status ois ON oi.status_id = ois.id
+              WHERE oi.order_id = o.id AND ois.is_final = FALSE
+            )
+            AND (
+              (dos.is_final = FALSE AND dos.code != 'concluido')
+              OR (dos.code = 'concluido')
+            )
+          )
+        );
     END IF;
 
     -- Loop de fornecedores
@@ -1321,7 +1715,27 @@ BEGIN
                 JOIN public.default_order_status dos ON o.status_id = dos.id
                 LEFT JOIN public.order_items oi ON oi.order_id = o.id
                 WHERE o.company_id = p_company_id
-                AND dos.is_final = FALSE
+                AND (
+                  -- Se todos os itens são finais, nunca envia followup
+                  NOT EXISTS (
+                    SELECT 1 FROM public.order_items oi2
+                    JOIN public.order_item_status ois2 ON oi2.status_id = ois2.id
+                    WHERE oi2.order_id = o.id AND ois2.is_final = FALSE
+                  )
+                  OR
+                  -- Se tem itens não finais, verifica o status do pedido
+                  (
+                    EXISTS (
+                      SELECT 1 FROM public.order_items oi2
+                      JOIN public.order_item_status ois2 ON oi2.status_id = ois2.id
+                      WHERE oi2.order_id = o.id AND ois2.is_final = FALSE
+                    )
+                    AND (
+                      (dos.is_final = FALSE AND dos.code != 'concluido')
+                      OR (dos.code = 'concluido')
+                    )
+                  )
+                )
                 AND (
                     (order_ids IS NOT NULL AND o.id = ANY(order_ids)) OR
                     (order_ids IS NULL)
@@ -1388,10 +1802,15 @@ BEGIN
       p_function_name := 'fn_send_payload_followup_cron',
       p_step          := 'build_payload',
       p_status        := 'success',
-      p_message       := 'Payload de fornecedores montado com sucesso para envio de follow-up.',
+      p_message       := format('Payload construído com sucesso para %s fornecedores com %s pedidos.',
+                               jsonb_array_length(payload),
+                               (SELECT SUM(jsonb_array_length(entry->'orders_payload')) 
+                                FROM jsonb_array_elements(payload) AS entry)),
       p_user_id       := NULL,
       p_metadata      := jsonb_build_object(
                             'total_fornecedores', jsonb_array_length(payload),
+                            'total_pedidos', (SELECT SUM(jsonb_array_length(entry->'orders_payload')) 
+                                             FROM jsonb_array_elements(payload) AS entry),
                             'executado_para_company_id', p_company_id
                         )
     );
@@ -1535,7 +1954,9 @@ BEGIN
                 p_function_name := 'fn_send_followup_emails_cron',
                 p_step          := 'edge_call',
                 p_status        := 'success',
-                p_message       := 'Follow-up enviado via cron para batch de ' || array_length(supplier_contacts_slice, 1) || ' contatos',
+                p_message       := format('Chamada para Edge Function bem-sucedida para %s pedidos em batch de %s contatos.',
+                                         jsonb_array_length(orders_payload), 
+                                         array_length(supplier_contacts_slice, 1)),
                 p_user_id       := NULL::UUID,  -- Diferença: NULL em vez de v_user_id
                 p_metadata      := entry
             );
@@ -1605,17 +2026,56 @@ BEGIN
     JOIN public.default_order_status dos ON o.status_id = dos.id
     WHERE o.company_id = v_company_id
       AND o.id = ANY(order_ids)
-      AND dos.is_final = FALSE;
+      AND (
+        -- Se tem itens não finais, verifica o status do pedido
+        EXISTS (
+          SELECT 1 FROM public.order_items oi
+          JOIN public.order_item_status ois ON oi.status_id = ois.id
+          WHERE oi.order_id = o.id AND ois.is_final = FALSE
+        )
+        AND (
+          (dos.is_final = FALSE AND dos.code != 'concluido')
+          OR (dos.code = 'concluido')
+        )
+      );
 
   ELSIF supplier_ids IS NOT NULL AND array_length(supplier_ids, 1) IS NOT NULL THEN
-    suppliers_to_process := supplier_ids;
+    -- Aplicar filtro mesmo quando supplier_ids é fornecido
+    SELECT array_agg(DISTINCT o.supplier_id) INTO suppliers_to_process
+    FROM public.orders o
+    JOIN public.default_order_status dos ON o.status_id = dos.id
+    WHERE o.company_id = v_company_id
+      AND o.supplier_id = ANY(supplier_ids)
+      AND (
+        -- Se tem itens não finais, verifica o status do pedido
+        EXISTS (
+          SELECT 1 FROM public.order_items oi
+          JOIN public.order_item_status ois ON oi.status_id = ois.id
+          WHERE oi.order_id = o.id AND ois.is_final = FALSE
+        )
+        AND (
+          (dos.is_final = FALSE AND dos.code != 'concluido')
+          OR (dos.code = 'concluido')
+        )
+      );
 
   ELSE
     SELECT array_agg(DISTINCT supplier_id) INTO suppliers_to_process
     FROM public.orders o
     JOIN public.default_order_status dos ON o.status_id = dos.id
     WHERE o.company_id = v_company_id
-      AND dos.is_final = FALSE;
+      AND (
+        -- Se tem itens não finais, verifica o status do pedido
+        EXISTS (
+          SELECT 1 FROM public.order_items oi
+          JOIN public.order_item_status ois ON oi.status_id = ois.id
+          WHERE oi.order_id = o.id AND ois.is_final = FALSE
+        )
+        AND (
+          (dos.is_final = FALSE AND dos.code != 'concluido')
+          OR (dos.code = 'concluido')
+        )
+      );
   END IF;
 
   -- Loop de fornecedores
@@ -1652,7 +2112,18 @@ BEGIN
             JOIN public.default_order_status dos ON o.status_id = dos.id
             LEFT JOIN public.order_items oi ON oi.order_id = o.id
             WHERE o.company_id = v_company_id
-              AND dos.is_final = FALSE
+              AND (
+                -- Se tem itens não finais, verifica o status do pedido
+                EXISTS (
+                  SELECT 1 FROM public.order_items oi2
+                  JOIN public.order_item_status ois2 ON oi2.status_id = ois2.id
+                  WHERE oi2.order_id = o.id AND ois2.is_final = FALSE
+                )
+                AND (
+                  (dos.is_final = FALSE AND dos.code != 'concluido')
+                  OR (dos.code = 'concluido')
+                )
+              )
               AND (
                 (order_ids IS NOT NULL AND o.id = ANY(order_ids)) OR
                 (order_ids IS NULL)
@@ -1717,10 +2188,15 @@ BEGIN
     p_function_name := 'fn_send_payload_followup',
     p_step          := 'build_payload',
     p_status        := 'success',
-    p_message       := 'Payload de fornecedores montado com sucesso para envio de follow-up.',
+    p_message       := format('Payload construído com sucesso para %s fornecedores com %s pedidos.',
+                             jsonb_array_length(payload),
+                             (SELECT SUM(jsonb_array_length(entry->'orders_payload')) 
+                              FROM jsonb_array_elements(payload) AS entry)),
     p_user_id       := v_uid,
     p_metadata      := jsonb_build_object(
                           'total_fornecedores', jsonb_array_length(payload),
+                          'total_pedidos', (SELECT SUM(jsonb_array_length(entry->'orders_payload')) 
+                                           FROM jsonb_array_elements(payload) AS entry),
                           'executado_para_company_id', v_company_id
                       )
   );
@@ -1878,7 +2354,9 @@ BEGIN
         p_function_name := 'fn_send_followup_emails',
         p_step          := 'edge_call',
         p_status        := 'success',
-        p_message       := 'Follow-up enviado para batch de ' || array_length(supplier_contacts_slice, 1) || ' contatos',
+        p_message       := format('Chamada para Edge Function bem-sucedida para %s pedidos em batch de %s contatos.',
+                                 jsonb_array_length(orders_payload), 
+                                 array_length(supplier_contacts_slice, 1)),
         p_user_id       := v_user_id,
         p_metadata      := entry
       );
@@ -2243,7 +2721,18 @@ BEGIN
   JOIN public.default_order_status dos ON dos.id = o.status_id
   WHERE o.company_id = v_company_id
     AND (v_status_id IS NULL OR o.status_id = v_status_id)
-    AND dos.is_final = FALSE
+    AND (
+      -- Se tem itens não finais, verifica o status do pedido
+      EXISTS (
+        SELECT 1 FROM public.order_items oi
+        JOIN public.order_item_status ois ON oi.status_id = ois.id
+        WHERE oi.order_id = o.id AND ois.is_final = FALSE
+      )
+      AND (
+        (dos.is_final = FALSE AND dos.code != 'concluido')
+        OR (dos.code = 'concluido')
+      )
+    )
     AND EXISTS (
         SELECT 1 FROM public.supplier_contacts sc
         WHERE sc.supplier_id = o.supplier_id
@@ -2301,7 +2790,18 @@ BEGIN
     AND o.due_date IS NOT NULL
     AND o.due_date <= (CURRENT_DATE + (v_days_before || ' days')::INTERVAL)
     AND o.due_date >= CURRENT_DATE
-    AND dos.is_final = FALSE
+    AND (
+      -- Se tem itens não finais, verifica o status do pedido
+      EXISTS (
+        SELECT 1 FROM public.order_items oi
+        JOIN public.order_item_status ois ON oi.status_id = ois.id
+        WHERE oi.order_id = o.id AND ois.is_final = FALSE
+      )
+      AND (
+        (dos.is_final = FALSE AND dos.code != 'concluido')
+        OR (dos.code = 'concluido')
+      )
+    )
     AND EXISTS (
         SELECT 1 FROM public.supplier_contacts sc
         WHERE sc.supplier_id = o.supplier_id
@@ -2358,7 +2858,18 @@ BEGIN
   LEFT JOIN private.followup_item_tracking fit ON (fit.order_item_id = oi.id AND fit.setting_id = p_setting_id)
   WHERE o.company_id = v_company_id
     AND (v_status_id IS NULL OR oi.status_id = v_status_id)
-    AND dos.is_final = FALSE
+    AND (
+      -- Se tem itens não finais, verifica o status do pedido
+      EXISTS (
+        SELECT 1 FROM public.order_items oi2
+        JOIN public.order_item_status ois2 ON oi2.status_id = ois2.id
+        WHERE oi2.order_id = o.id AND ois2.is_final = FALSE
+      )
+      AND (
+        (dos.is_final = FALSE AND dos.code != 'concluido')
+        OR (dos.code = 'concluido')
+      )
+    )
     AND EXISTS (
         SELECT 1 FROM public.supplier_contacts sc
         WHERE sc.supplier_id = o.supplier_id
@@ -2414,7 +2925,18 @@ BEGIN
     AND oi.due_date IS NOT NULL
     AND oi.due_date <= (CURRENT_DATE + (v_days_before || ' days')::INTERVAL)
     AND oi.due_date >= CURRENT_DATE
-    AND dos.is_final = FALSE
+    AND (
+      -- Se tem itens não finais, verifica o status do pedido
+      EXISTS (
+        SELECT 1 FROM public.order_items oi2
+        JOIN public.order_item_status ois2 ON oi2.status_id = ois2.id
+        WHERE oi2.order_id = o.id AND ois2.is_final = FALSE
+      )
+      AND (
+        (dos.is_final = FALSE AND dos.code != 'concluido')
+        OR (dos.code = 'concluido')
+      )
+    )
     AND EXISTS (
         SELECT 1 FROM public.supplier_contacts sc
         WHERE sc.supplier_id = o.supplier_id
@@ -2469,7 +2991,18 @@ BEGIN
     AND oi.current_delivery_date IS NOT NULL
     AND oi.current_delivery_date <= (CURRENT_DATE + (v_days_before || ' days')::INTERVAL)
     AND oi.current_delivery_date >= CURRENT_DATE
-    AND dos.is_final = FALSE
+    AND (
+      -- Se tem itens não finais, verifica o status do pedido
+      EXISTS (
+        SELECT 1 FROM public.order_items oi2
+        JOIN public.order_item_status ois2 ON oi2.status_id = ois2.id
+        WHERE oi2.order_id = o.id AND ois2.is_final = FALSE
+      )
+      AND (
+        (dos.is_final = FALSE AND dos.code != 'concluido')
+        OR (dos.code = 'concluido')
+      )
+    )
     AND EXISTS (
         SELECT 1 FROM public.supplier_contacts sc
         WHERE sc.supplier_id = o.supplier_id
@@ -2783,5 +3316,59 @@ BEGIN
               updated_at = NOW();
       END LOOP;
   END LOOP;
+END;
+$$;
+
+-- Função para buscar notificações com informações completas de usuários
+CREATE OR REPLACE FUNCTION public.fn_get_order_notifications()
+RETURNS TABLE (
+    id BIGINT,
+    order_id BIGINT,
+    order_item_id BIGINT,
+    type TEXT,
+    message TEXT,
+    is_read BOOLEAN,
+    created_at TIMESTAMP,
+    read_by UUID,
+    read_by_name TEXT,
+    read_by_email TEXT,
+    read_by_user_type TEXT,
+    is_from_client BOOLEAN
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path TO 'public'
+AS $$
+BEGIN
+    RETURN QUERY
+    SELECT
+        onf.id,
+        onf.order_id,
+        onf.order_item_id,
+        onf.type,
+        onf.message,
+        onf.is_read,
+        onf.created_at,
+        onf.read_by,
+        -- Buscar nome e email do usuário que marcou como lida
+        COALESCE(cu.name, sc.name) AS read_by_name,
+        COALESCE(cu.email, sc.email) AS read_by_email,
+        -- Identificar o tipo de usuário que marcou como lida
+        CASE 
+            WHEN cu.id IS NOT NULL THEN 'client'::TEXT
+            WHEN su.id IS NOT NULL THEN 'supplier'::TEXT
+            ELSE NULL::TEXT
+        END AS read_by_user_type,
+        -- Identificar se a notificação é do cliente
+        CASE 
+            WHEN onf.type IN ('client_observation', 'client_status_change', 'client_item_change') THEN true
+            ELSE false
+        END AS is_from_client
+    FROM public.order_notifications onf
+    -- LEFT JOIN para buscar usuários compradores/admins
+    LEFT JOIN public.company_users cu ON cu.id = onf.read_by
+    -- LEFT JOIN para buscar usuários fornecedores via supplier_users -> supplier_contacts
+    LEFT JOIN public.supplier_users su ON su.id = onf.read_by
+    LEFT JOIN public.supplier_contacts sc ON sc.id = su.supplier_contact_id;
 END;
 $$;

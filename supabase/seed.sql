@@ -18,7 +18,7 @@ VALUES
   (2, 'confirmado', 'Confirmado - Aguardando Entrega', 'Pedido confirmado pelo fornecedor', 2, FALSE),
   (3, 'recusado', 'Recusado', 'Pedido recusado pelo fornecedor', 2, FALSE),
   (4, 'parcial', 'Entregas Parciais', 'Pedido com entregas parciais', 3, FALSE),
-  (5, 'concluido', 'Concluído', 'Pedido concluído', 4, TRUE),
+  (5, 'concluido', 'Concluído', 'Pedido concluído', 4, FALSE), --Logica para Transpetro
   (6, 'cancelado', 'Cancelado', 'Pedido cancelado', 5, TRUE);
 
 INSERT INTO auth.users (id, aud, role, email, encrypted_password, email_confirmed_at, last_sign_in_at, raw_app_meta_data, raw_user_meta_data, created_at, updated_at, is_sso_user, is_anonymous) 
@@ -34,22 +34,22 @@ INSERT INTO public.companies (
 
 -- Tabela public.order_status (Criando status para cada empresa)
 INSERT INTO public.order_item_status (
-    id, company_id, name, color, position, is_final, created_at
+    id, company_id, name, color, position, is_final, expose_to_supplier, default_status_id, created_at
 )
 VALUES
-    (1, 1, 'Aguardando confirmação do pedido', '#FFEB3B', 1, false, now()),
-    (2, 1, 'Aguardando entrega', '#FFC107', 2, false, now()),
-    (3, 1, 'Entrega informada', '#4CAF50', 3, false, now()),
-    (4, 1, 'Aguardando MIGO', '#03A9F4', 4, false, now()),
-    (5, 1, 'Aguardando MIRO', '#00BCD4', 5, false, now()),
-    (6, 1, 'Aguardando pagamento', '#2196F3', 6, false, now()),
-    (7, 1, 'Pagamento realizado', '#4CAF50', 7, true, now()),
-    (8, 1, 'Declinio', '#F44336', 8, false, now()),
-    (9, 1, 'Em revisão', '#9C27B0', 9, false, now()),
-    (10, 1, 'Esclarecimento técnico', '#3F51B5', 10, false, now()),
-    (11, 1, 'Devolução/ Troca', '#795548', 11, false, now()),
-    (12, 1, 'Pedido cancelado motivado pelo fornecedor', '#E91E63', 12, true, now()),
-    (13, 1, 'Pedido cancelado motivado pela Transpetro', '#607D8B', 13, true, now());
+    (1, 1, 'Aguardando confirmação do pedido', '#FFEB3B', 1, false, true, 1, now()),
+    (2, 1, 'Aguardando entrega', '#FFC107', 2, false, true, 2, now()),
+    (3, 1, 'Entrega informada', '#4CAF50', 3, false, true, NULL, now()),
+    (4, 1, 'Aguardando MIGO', '#03A9F4', 4, false, true, NULL, now()),
+    (5, 1, 'Aguardando MIRO', '#00BCD4', 5, false, true, NULL, now()),
+    (6, 1, 'Aguardando pagamento', '#2196F3', 6, false, true, NULL, now()),
+    (7, 1, 'Pagamento realizado', '#4CAF50', 7, true, true, NULL, now()),
+    (8, 1, 'Declinio', '#F44336', 8, false, true, 3, now()),
+    (9, 1, 'Em revisão', '#9C27B0', 9, false, true, NULL, now()),
+    (10, 1, 'Esclarecimento técnico', '#3F51B5', 10, false, true, NULL, now()),
+    (11, 1, 'Devolução/ Troca', '#795548', 11, false, true, NULL, now()),
+    (12, 1, 'Pedido cancelado motivado pelo fornecedor', '#E91E63', 12, true, true, NULL, now()),
+    (13, 1, 'Pedido cancelado motivado pela Transpetro', '#607D8B', 13, true, true, 6, now());
 
 
 -- Seed de configurações de follow-up para a Empresa 1 (com IDs explícitos)
@@ -58,7 +58,7 @@ INSERT INTO public.followup_settings (
     repeat_interval_days, max_followups, email_template, notification_type, is_active, created_at, is_system_config
 )
 VALUES
-    (1, 1, 'Pedido aguardando confirmação', 'default_order_status', 1, 2, 2, 3, 'template_aguardando_confirmacao', 'email', TRUE, now(), FALSE),
+    (1, 1, 'Pedido aguardando confirmação', 'item_status', 1, 0, 2, 3, 'template_aguardando_confirmacao', 'email', TRUE, now(), FALSE),
     (2, 1, 'Item aguardando entrega', 'item_status', 2, 3, 3, 2, 'template_aguardando_entrega', 'email', TRUE, now(), FALSE),
     (3, 1, 'Entrega em atraso', 'item_delivery_date', NULL, 0, 2, 5, 'template_entrega_atrasada', 'email', TRUE, now(), FALSE),
     (4, 1, 'Aguardando MIGO', 'item_status', 4, 1, 2, 2, 'template_migo_pendente', 'email', TRUE, now(), FALSE),
@@ -74,8 +74,7 @@ SET
     "po_header_mapping": [
         { "db_field": "public.orders.order_number", "required": true, "field_label": "Número do pedido", "file_column_name": "numero_do_pedido", "original_column_name": "Número do pedido" },
         { "db_field": "public.suppliers.external_id", "required": true, "field_label": "ID do fornecedor", "file_column_name": "id_do_fornecedor", "original_column_name": "ID do fornecedor" },    
-        { "db_field": "public.orders.order_description", "required": false, "field_label": "Descrição do pedido", "file_column_name": "descricao_do_pedido", "original_column_name": "Descrição do pedido" },    
-        { "db_field": "public.orders.due_date", "required": false, "field_label": "Data da remessa - Pedido", "file_column_name": "data_da_remessa__pedido", "original_column_name": "Data da remessa - Pedido" },    
+        { "db_field": "public.orders.order_description", "required": false, "field_label": "Descrição do pedido", "file_column_name": "descricao_do_pedido", "original_column_name": "Descrição do pedido" }, 
         { "db_field": "public.order_items.item_number", "required": true, "field_label": "Item do pedido", "file_column_name": "item_do_pedido", "original_column_name": "Item do pedido" },    
         { "db_field": "public.order_items.product", "required": true, "field_label": "Material", "file_column_name": "material", "original_column_name": "Material" },    
         { "db_field": "public.order_items.product_description", "required": false, "field_label": "Descrição do Material", "file_column_name": "descricao_do_material", "original_column_name": "Descrição do Material" },    
@@ -83,15 +82,18 @@ SET
         { "db_field": "public.order_items.unity_of_measure", "required": false, "field_label": "Unidade de medida", "file_column_name": "unidade_de_medida", "original_column_name": "Unidade de medida" },    
         { "db_field": "public.order_items.unit_price", "required": true, "field_label": "Preço unitário do produto", "file_column_name": "preco_unitario_do_produto", "original_column_name": "Preço unitário do produto" },    
         { "db_field": "public.order_items.plant", "required": false, "field_label": "Centro", "file_column_name": "centro", "original_column_name": "Centro" },    
-        { "db_field": "public.order_items.due_date", "required": true, "field_label": "Data da Remessa - Item", "file_column_name": "data_da_remessa__item", "original_column_name": "Data da Remessa - Item" }    
+        { "db_field": "public.order_items.due_date", "required": true, "field_label": "Data da Remessa - Item", "file_column_name": "data_da_remessa__item", "original_column_name": "Data da Remessa - Item" },
+        { "db_field": "public.order_items.bidding_description", "required": false, "field_label": "Descrição da licitação", "file_column_name": "descricao_da_licitacao", "original_column_name": "Descrição da licitação" },
+        { "db_field": "public.order_items.custom_deliver_time", "required": false, "field_label": "Prazo de fornecimento", "file_column_name": "prazo_de_fornecimento", "original_column_name": "Prazo de fornecimento" },
+        { "db_field": "public.order_items.purchase_req", "required": false, "field_label": "Número da requisição", "file_column_name": "numero_da_requisicao", "original_column_name": "Número da requisição" },
+        { "db_field": "public.order_items.purchase_req_item", "required": false, "field_label": "Item da requisição", "file_column_name": "item_da_requisicao", "original_column_name": "Item da requisição" }    
     ]
   }'::jsonb,
   default_field_mapping = '{
     "po_header_mapping": [
         { "db_field": "public.orders.order_number", "required": true, "field_label": "Número do pedido", "file_column_name": "numero_do_pedido", "original_column_name": "Número do pedido" },
         { "db_field": "public.suppliers.external_id", "required": true, "field_label": "ID do fornecedor", "file_column_name": "id_do_fornecedor", "original_column_name": "ID do fornecedor" },    
-        { "db_field": "public.orders.order_description", "required": false, "field_label": "Descrição do pedido", "file_column_name": "descricao_do_pedido", "original_column_name": "Descrição do pedido" },    
-        { "db_field": "public.orders.due_date", "required": false, "field_label": "Data da remessa - Pedido", "file_column_name": "data_da_remessa__pedido", "original_column_name": "Data da remessa - Pedido" },    
+        { "db_field": "public.orders.order_description", "required": false, "field_label": "Descrição do pedido", "file_column_name": "descricao_do_pedido", "original_column_name": "Descrição do pedido" }, 
         { "db_field": "public.order_items.item_number", "required": true, "field_label": "Item do pedido", "file_column_name": "item_do_pedido", "original_column_name": "Item do pedido" },    
         { "db_field": "public.order_items.product", "required": true, "field_label": "Material", "file_column_name": "material", "original_column_name": "Material" },    
         { "db_field": "public.order_items.product_description", "required": false, "field_label": "Descrição do Material", "file_column_name": "descricao_do_material", "original_column_name": "Descrição do Material" },    
@@ -99,7 +101,11 @@ SET
         { "db_field": "public.order_items.unity_of_measure", "required": false, "field_label": "Unidade de medida", "file_column_name": "unidade_de_medida", "original_column_name": "Unidade de medida" },    
         { "db_field": "public.order_items.unit_price", "required": true, "field_label": "Preço unitário do produto", "file_column_name": "preco_unitario_do_produto", "original_column_name": "Preço unitário do produto" },    
         { "db_field": "public.order_items.plant", "required": false, "field_label": "Centro", "file_column_name": "centro", "original_column_name": "Centro" },    
-        { "db_field": "public.order_items.due_date", "required": true, "field_label": "Data da Remessa - Item", "file_column_name": "data_da_remessa__item", "original_column_name": "Data da Remessa - Item" }    
+        { "db_field": "public.order_items.due_date", "required": true, "field_label": "Data da Remessa - Item", "file_column_name": "data_da_remessa__item", "original_column_name": "Data da Remessa - Item" },
+        { "db_field": "public.order_items.bidding_description", "required": false, "field_label": "Descrição da licitação", "file_column_name": "descricao_da_licitacao", "original_column_name": "Descrição da licitação" },
+        { "db_field": "public.order_items.custom_deliver_time", "required": false, "field_label": "Prazo de fornecimento", "file_column_name": "prazo_de_fornecimento", "original_column_name": "Prazo de fornecimento" },
+        { "db_field": "public.order_items.purchase_req", "required": false, "field_label": "Número da requisição", "file_column_name": "numero_da_requisicao", "original_column_name": "Número da requisição" },
+        { "db_field": "public.order_items.purchase_req_item", "required": false, "field_label": "Item da requisição", "file_column_name": "item_da_requisicao", "original_column_name": "Item da requisição" }   
     ]
   }'::jsonb,
   updated_at = now()

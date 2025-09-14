@@ -13,30 +13,30 @@ SELECT
     (DATE_TRUNC('month', NOW()) + INTERVAL '1 month' - INTERVAL '1 day')::DATE AS period_end,
     COUNT(DISTINCT oi.id) AS total_order_lines,
     COALESCE(SUM(
-      CASE 
+    CASE 
         WHEN fl.supplier_contacts IS NOT NULL 
         THEN cardinality(fl.supplier_contacts)
         ELSE 0
-      END
+    END
     ), 0) AS total_emails_sent
 FROM public.company_users u
 JOIN public.companies c ON c.id = u.company_id
 LEFT JOIN public.orders o 
-  ON o.company_id = u.company_id
-  AND o.created_at >= DATE_TRUNC('month', NOW())
-  AND o.created_at < (DATE_TRUNC('month', NOW()) + INTERVAL '1 month')
+ON o.company_id = u.company_id
+AND o.created_at >= DATE_TRUNC('month', NOW())
+AND o.created_at < (DATE_TRUNC('month', NOW()) + INTERVAL '1 month')
 LEFT JOIN public.order_items oi 
-  ON oi.order_id = o.id
-  AND oi.created_at >= DATE_TRUNC('month', NOW())
-  AND oi.created_at < (DATE_TRUNC('month', NOW()) + INTERVAL '1 month')
+ON oi.order_id = o.id
+AND oi.created_at >= DATE_TRUNC('month', NOW())
+AND oi.created_at < (DATE_TRUNC('month', NOW()) + INTERVAL '1 month')
 LEFT JOIN public.followup_logs fl 
-  ON fl.company_id = u.company_id
-  AND fl.sent_at >= DATE_TRUNC('month', NOW())
-  AND fl.sent_at < (DATE_TRUNC('month', NOW()) + INTERVAL '1 month')
+ON fl.company_id = u.company_id
+AND fl.sent_at >= DATE_TRUNC('month', NOW())
+AND fl.sent_at < (DATE_TRUNC('month', NOW()) + INTERVAL '1 month')
 WHERE EXISTS (
-  SELECT 1
-  FROM private.user_access_cache uac
-  WHERE uac.user_id = (select auth.uid())
+SELECT 1
+FROM private.user_access_cache uac
+WHERE uac.user_id = (select auth.uid())
     AND uac.role_name = 'admin'
     AND uac.is_active = true
     AND uac.company_id = u.company_id
@@ -49,25 +49,72 @@ CREATE OR REPLACE VIEW public.view_orders
 WITH (security_invoker = true)
 AS
 SELECT
-  o.id,
-  o.order_number,
-  o.order_description,
-  s.external_id,
-  s.name AS supplier_name,
-  o.due_date,
-  dos.id AS status_id,
-  dos.name AS status_name,
-  o.created_at,
-  o.updated_at,
-  EXISTS (
+o.id,
+o.order_number,
+o.order_description,
+s.external_id,
+s.name AS supplier_name,
+o.due_date,
+dos.id AS status_id,
+dos.name AS status_name,
+o.created_at,
+o.updated_at,
+CASE
+  WHEN dos.is_final = TRUE AND dos.code != 'concluido' THEN false
+  WHEN NOT EXISTS (
+    SELECT 1 FROM public.order_items oi
+    JOIN public.order_item_status ois ON oi.status_id = ois.id
+    WHERE oi.order_id = o.id AND ois.is_final = FALSE
+  ) THEN false  -- Se todos os itens são finais, nunca é atrasado
+  WHEN EXISTS (
+    SELECT 1 FROM public.order_items oi
+    JOIN public.order_item_status ois ON oi.status_id = ois.id
+    WHERE oi.order_id = o.id AND ois.is_final = FALSE
+  ) AND dos.code = 'concluido' THEN true  -- Concluído com itens não finais é atrasado
+  ELSE CURRENT_DATE > o.due_date
+END AS overdue_order,
+-- Notificações do fornecedor (para compradores verem)
+EXISTS (
     SELECT 1
     FROM public.order_notifications orn
     WHERE orn.order_id = o.id
       AND orn.is_read = false
-  ) AS has_notifications
+      AND orn.type IN ('order_status_change', 'delivery_date_change', 'item_status_change', 'item_invoiced')
+) AS has_notifications_from_supplier,
+
+-- Notificações do comprador (para fornecedores verem)
+EXISTS (
+    SELECT 1
+    FROM public.order_notifications orn
+    WHERE orn.order_id = o.id
+      AND orn.is_read = false
+      AND orn.type IN ('client_observation', 'client_status_change', 'client_item_change')
+) AS has_notifications_from_client,
+
+-- Flag: existe pelo menos uma notificação não lida? (compatibilidade)
+EXISTS (
+    SELECT 1
+    FROM public.order_notifications orn
+    WHERE orn.order_id = o.id
+    AND orn.is_read = false
+) AS has_notifications,
+-- Adiciona o status_id com menor position dos order_items
+COALESCE(min_status.status_id, NULL) AS order_items_min_status_id,
+COALESCE(min_status.status_name, NULL) AS order_items_min_status_name
 FROM public.orders o
 JOIN public.suppliers s ON s.id = o.supplier_id
 JOIN public.default_order_status dos ON dos.id = o.status_id
+LEFT JOIN LATERAL (
+  SELECT 
+    oi.status_id,
+    ois.name AS status_name
+  FROM public.order_items oi
+  LEFT JOIN public.order_item_status ois ON oi.status_id = ois.id
+  WHERE oi.order_id = o.id
+    AND oi.status_id IS NOT NULL
+  ORDER BY COALESCE(ois.position, 999999) ASC
+  LIMIT 1
+) min_status ON true
 LIMIT 1000;
 
 /* 
@@ -107,9 +154,9 @@ SELECT
 
     -- Flag: existe pelo menos uma notificação não lida?
     EXISTS (
-      SELECT 1
-      FROM public.order_notifications
-      WHERE order_item_id = oi.id
+    SELECT 1
+    FROM public.order_notifications
+    WHERE order_item_id = oi.id
         AND is_read = false
     ) AS has_unread_notification
 
@@ -119,44 +166,32 @@ LEFT JOIN LATERAL (
     SELECT type, message, is_read
     FROM public.order_notifications
     WHERE order_item_id = oi.id
-      AND is_read = false
+    AND is_read = false
     ORDER BY created_at DESC
     LIMIT 1
 ) n ON true;
 */
 
 -- Criar view para listar as notificações dos pedidos
-CREATE OR REPLACE VIEW public.view_order_notifications
-WITH (security_invoker = true) AS
-SELECT
-  onf.id,
-  onf.order_id,
-  onf.order_item_id,
-  onf.type,
-  onf.message,
-  onf.is_read,
-  onf.created_at,
-  onf.read_by,
-  cu.name AS read_by_name,
-  cu.email AS read_by_email
-FROM public.order_notifications onf
-LEFT JOIN public.company_users cu ON cu.id = onf.read_by;
+CREATE OR REPLACE VIEW public.view_order_notifications 
+WITH (security_invoker = true) AS  -- ← E AQUI TAMBÉM
+SELECT * FROM public.fn_get_order_notifications();
 
 
 -- Criar view para listar os registros de processo realizados por usuários
 CREATE OR REPLACE VIEW public.view_user_process_logs
 WITH (security_invoker = true) AS
 SELECT
-  pl.id,
-  pl.process_name,
-  pl.function_name,
-  pl.step,
-  pl.status,
-  pl.message,
-  pl.user_id,
-  pl.metadata,
-  pl.created_at,
-  CASE pl.process_name
+pl.id,
+pl.process_name,
+pl.function_name,
+pl.step,
+pl.status,
+pl.message,
+pl.user_id,
+pl.metadata,
+pl.created_at,
+CASE pl.process_name
     WHEN 'orders_upload'              THEN 'Importação de Pedidos'
     WHEN 'suppliers_upload'           THEN 'Importação de Fornecedores'
     WHEN 'send_followup_emails'       THEN 'Envio de Follow-ups'
@@ -165,17 +200,17 @@ SELECT
     WHEN 'create_new_user'            THEN 'Criação de Novo Usuário'
     WHEN 'delete_inactive_auth_users' THEN 'Limpeza de Usuários Inativos'
     ELSE pl.process_name
-  END AS process_label,
-  CASE pl.status
+END AS process_label,
+CASE pl.status
     WHEN 'success' THEN 'Sucesso'
     WHEN 'error'   THEN 'Erro'
     WHEN 'warning' THEN 'Alerta'
     WHEN 'info'    THEN 'Informação'
     WHEN 'skip'    THEN 'Ignorado'
     ELSE pl.status
-  END AS status_label,
-  cu.name  AS user_name,
-  cu.email AS user_email
+END AS status_label,
+cu.name  AS user_name,
+cu.email AS user_email
 FROM private.process_logs pl
 LEFT JOIN public.company_users cu ON cu.id = pl.user_id;
 
@@ -280,13 +315,13 @@ CREATE OR REPLACE VIEW public.view_user_access_cache
 WITH (security_invoker = true)
 AS
 SELECT
-  user_id AS id,
-  role_id,
-  role_name,
-  company_id,
-  supplier_id,
-  is_active,
-  last_synced_at
+user_id AS id,
+role_id,
+role_name,
+company_id,
+supplier_id,
+is_active,
+last_synced_at
 FROM private.user_access_cache;
 
 
@@ -301,6 +336,7 @@ SELECT
     MAX(created_at) as newest
 FROM private.followup_queue
 GROUP BY status;
+
 
 -- Criar view para Acompanhar performance e identificar problemas: Performance por empresa
 CREATE OR REPLACE VIEW public.view_followup_performance
@@ -317,6 +353,7 @@ JOIN public.companies c ON c.id = fq.company_id
 WHERE fq.created_at > NOW() - INTERVAL '7 days'
 GROUP BY c.name, fq.status
 ORDER BY c.name, fq.status;
+
 
 -- Criar view para Acompanhar performance e identificar problemas: Regras mais ativas
 CREATE OR REPLACE VIEW public.view_followup_rules_activity
@@ -336,6 +373,7 @@ WHERE fs.is_active = true
 GROUP BY fs.id, fs.rule_name, fs.trigger_scope, c.name, fs.last_sent_at, fs.send_days_interval
 ORDER BY queue_items DESC;
 
+
 -- Criar view para visualizar status personalizados com o nome do status global
 CREATE OR REPLACE VIEW public.view_order_item_status
 WITH (security_invoker = true)
@@ -354,6 +392,7 @@ SELECT
 FROM public.order_item_status ois
 LEFT JOIN public.default_order_status dos ON ois.default_status_id = dos.id;
 
+
 -- Criar view para visualizar configurações de follow-up com descrição do trigger scope
 CREATE OR REPLACE VIEW public.view_followup_settings
 WITH (security_invoker = true)
@@ -368,7 +407,7 @@ SELECT
     CASE 
         WHEN fs.trigger_scope = 'default_order_status' THEN 'Status de Pedido'
         WHEN fs.trigger_scope = 'order_due_date' THEN 'Data de Vencimento do Pedido'
-        WHEN fs.trigger_scope = 'item_status' THEN 'Status de Item'
+        WHEN fs.trigger_scope = 'item_status' THEN 'Status'
         WHEN fs.trigger_scope = 'item_due_date' THEN 'Data de Vencimento do Item'
         WHEN fs.trigger_scope = 'item_delivery_date' THEN 'Data de Entrega do Item'
         WHEN fs.trigger_scope = 'manual_user_trigger' THEN 'Trigger Manual do Usuário'
@@ -394,6 +433,7 @@ SELECT
 FROM public.followup_settings fs
 WHERE fs.is_system_config = false;
 
+
 -- Criar view para visualizar observações da order e item com item_number
 CREATE OR REPLACE VIEW public.view_order_and_item_observations
 WITH (security_invoker = true)
@@ -413,6 +453,7 @@ SELECT
 FROM public.order_and_item_observations oio
 LEFT JOIN public.order_items oi ON oio.order_item_id = oi.id
 LEFT JOIN public.orders o ON oio.order_id = o.id;
+
 
 -- Criar view que combina informações de itens de pedido e pedidos com suas respectivas faturas/notas fiscais
 CREATE VIEW public.view_order_and_item_invoices
@@ -437,3 +478,176 @@ ORDER BY
     oi.order_id, 
     oi.item_number, 
     oii.nfe_date;
+
+
+-- Criar view inteligente para visualizar logs de alterações dos pedidos
+CREATE OR REPLACE VIEW public.view_order_change_logs
+WITH (security_invoker = true)
+AS
+WITH combined_logs AS (
+    -- Logs de pedidos
+    SELECT 
+        'order' AS log_type,
+        ol.id,
+        ol.order_id,
+        NULL AS order_item_id,
+        ol.changed_by_client,
+        ol.changed_by_supplier,
+        ol.source,
+        ol.created_at,
+        -- Informações do pedido
+        o.order_number,
+        o.order_description,
+        s.name AS supplier_name,
+        dos_old.name AS old_status_name,
+        dos_new.name AS new_status_name,
+        ol.old_due_date,
+        ol.new_due_date,
+        ol.old_order_number,
+        ol.new_order_number,
+        ol.old_order_description,
+        ol.new_order_description,
+        ol.change_reason,
+        -- Campos para identificar mudanças
+        CASE 
+            WHEN ol.old_status_id IS DISTINCT FROM ol.new_status_id THEN 'status'
+            WHEN ol.old_due_date IS DISTINCT FROM ol.new_due_date THEN 'due_date'
+            WHEN ol.old_order_number IS DISTINCT FROM ol.new_order_number THEN 'order_number'
+            WHEN ol.old_order_description IS DISTINCT FROM ol.new_order_description THEN 'order_description'
+            ELSE 'other'
+        END AS change_type,
+        -- Label
+        CASE 
+            WHEN ol.old_status_id IS DISTINCT FROM ol.new_status_id THEN 'Status'
+            WHEN ol.old_due_date IS DISTINCT FROM ol.new_due_date THEN 'Data de Vencimento'
+            WHEN ol.old_order_number IS DISTINCT FROM ol.new_order_number THEN 'Número do Pedido'
+            WHEN ol.old_order_description IS DISTINCT FROM ol.new_order_description THEN 'Descrição do Pedido'
+            ELSE 'Outro'
+        END AS change_type_label,
+        -- Descrição da mudança
+        CASE 
+            WHEN ol.old_status_id IS DISTINCT FROM ol.new_status_id THEN 
+                'Status alterado de "' || COALESCE(dos_old.name, 'N/A') || '" para "' || COALESCE(dos_new.name, 'N/A') || '"'
+            WHEN ol.old_due_date IS DISTINCT FROM ol.new_due_date THEN 
+                'Data de vencimento alterada de "' || COALESCE(ol.old_due_date::TEXT, 'N/A') || '" para "' || COALESCE(ol.new_due_date::TEXT, 'N/A') || '"'
+            WHEN ol.old_order_number IS DISTINCT FROM ol.new_order_number THEN 
+                'Número do pedido alterado de "' || COALESCE(ol.old_order_number, 'N/A') || '" para "' || COALESCE(ol.new_order_number, 'N/A') || '"'
+            WHEN ol.old_order_description IS DISTINCT FROM ol.new_order_description THEN 
+                'Descrição do pedido alterada'
+            ELSE 'Alteração realizada'
+        END AS change_description
+    FROM public.order_logs ol
+    JOIN public.orders o ON o.id = ol.order_id
+    JOIN public.suppliers s ON s.id = o.supplier_id
+    LEFT JOIN public.default_order_status dos_old ON dos_old.id = ol.old_status_id
+    LEFT JOIN public.default_order_status dos_new ON dos_new.id = ol.new_status_id
+    
+    UNION ALL
+    
+    -- Logs de itens de pedido
+    SELECT 
+        'item' AS log_type,
+        oil.id,
+        oil.order_item_id AS order_id, -- Usando order_item_id como order_id para manter consistência
+        oil.order_item_id,
+        oil.changed_by_client,
+        oil.changed_by_supplier,
+        oil.source,
+        oil.created_at,
+        -- Informações do pedido (via item)
+        o.order_number,
+        o.order_description,
+        s.name AS supplier_name,
+        -- Status
+        ois_old.name AS old_status_name,
+        ois_new.name AS new_status_name,
+        -- Outros campos
+        oil.old_due_date,
+        oil.new_due_date,
+        NULL AS old_order_number,
+        NULL AS new_order_number,
+        NULL AS old_order_description,
+        NULL AS new_order_description,
+        NULL AS change_reason,
+        -- Campos para identificar mudanças
+        CASE 
+            WHEN oil.old_status_id IS DISTINCT FROM oil.new_status_id THEN 'status'
+            WHEN oil.old_due_date IS DISTINCT FROM oil.new_due_date THEN 'due_date'
+            WHEN oil.old_product IS DISTINCT FROM oil.new_product THEN 'product'
+            WHEN oil.old_quantity IS DISTINCT FROM oil.new_quantity THEN 'quantity'
+            WHEN oil.old_unit_price IS DISTINCT FROM oil.new_unit_price THEN 'unit_price'
+            WHEN oil.old_current_delivery_date IS DISTINCT FROM oil.new_current_delivery_date THEN 'delivery_date'
+            ELSE 'other'
+        END AS change_type,
+        -- Label
+        CASE 
+            WHEN oil.old_status_id IS DISTINCT FROM oil.new_status_id THEN 'Status'
+            WHEN oil.old_due_date IS DISTINCT FROM oil.new_due_date THEN 'Data de Vencimento'
+            WHEN oil.old_product IS DISTINCT FROM oil.new_product THEN 'Produto'
+            WHEN oil.old_quantity IS DISTINCT FROM oil.new_quantity THEN 'Quantidade'
+            WHEN oil.old_unit_price IS DISTINCT FROM oil.new_unit_price THEN 'Preço Unitário'
+            WHEN oil.old_current_delivery_date IS DISTINCT FROM oil.new_current_delivery_date THEN 'Data de Entrega'
+            ELSE 'Outro'
+        END AS change_type_label,
+        -- Descrição da mudança
+        CASE 
+            WHEN oil.old_status_id IS DISTINCT FROM oil.new_status_id THEN 
+                'Status do item alterado de "' || COALESCE(ois_old.name, 'N/A') || '" para "' || COALESCE(ois_new.name, 'N/A') || '"'
+            WHEN oil.old_due_date IS DISTINCT FROM oil.new_due_date THEN 
+                'Data de vencimento do item alterada de "' || COALESCE(oil.old_due_date::TEXT, 'N/A') || '" para "' || COALESCE(oil.new_due_date::TEXT, 'N/A') || '"'
+            WHEN oil.old_product IS DISTINCT FROM oil.new_product THEN 
+                'Produto alterado de "' || COALESCE(oil.old_product, 'N/A') || '" para "' || COALESCE(oil.new_product, 'N/A') || '"'
+            WHEN oil.old_quantity IS DISTINCT FROM oil.new_quantity THEN 
+                'Quantidade alterada de "' || COALESCE(oil.old_quantity::TEXT, 'N/A') || '" para "' || COALESCE(oil.new_quantity::TEXT, 'N/A') || '"'
+            WHEN oil.old_unit_price IS DISTINCT FROM oil.new_unit_price THEN 
+                'Preço unitário alterado de "' || COALESCE(oil.old_unit_price::TEXT, 'N/A') || '" para "' || COALESCE(oil.new_unit_price::TEXT, 'N/A') || '"'
+            WHEN oil.old_current_delivery_date IS DISTINCT FROM oil.new_current_delivery_date THEN 
+                'Data de entrega alterada de "' || COALESCE(oil.old_current_delivery_date::TEXT, 'N/A') || '" para "' || COALESCE(oil.new_current_delivery_date::TEXT, 'N/A') || '"'
+            ELSE 'Alteração realizada no item'
+        END AS change_description
+    FROM public.order_item_logs oil
+    JOIN public.order_items oi ON oi.id = oil.order_item_id
+    JOIN public.orders o ON o.id = oi.order_id
+    JOIN public.suppliers s ON s.id = o.supplier_id
+    LEFT JOIN public.order_item_status ois_old ON ois_old.id = oil.old_status_id
+    LEFT JOIN public.order_item_status ois_new ON ois_new.id = oil.new_status_id
+)
+SELECT 
+    cl.*,
+    -- Informações do usuário que fez a alteração
+    CASE 
+        WHEN cl.changed_by_client IS NOT NULL THEN cu.name
+        WHEN cl.changed_by_supplier IS NOT NULL THEN sc.name
+        ELSE 'Sistema'
+    END AS changed_by_name,
+    CASE 
+        WHEN cl.changed_by_client IS NOT NULL THEN cu.email
+        WHEN cl.changed_by_supplier IS NOT NULL THEN sc.email
+        ELSE NULL
+    END AS changed_by_email,
+    -- Tipo de usuário
+    CASE 
+        WHEN cl.changed_by_client IS NOT NULL THEN 'Cliente'
+        WHEN cl.changed_by_supplier IS NOT NULL THEN 'Fornecedor'
+        ELSE 'Sistema'
+    END AS user_type,
+    -- Informações do item (se aplicável)
+    oi.item_number,
+    oi.product AS item_product,
+    oi.product_description AS item_product_description,
+    -- Formatação de data
+    TO_CHAR(cl.created_at, 'DD/MM/YYYY HH24:MI:SS') AS formatted_created_at,
+    -- Tempo relativo
+    CASE 
+        WHEN cl.created_at > NOW() - INTERVAL '1 hour' THEN 'Agora mesmo'
+        WHEN cl.created_at > NOW() - INTERVAL '24 hours' THEN 
+            EXTRACT(HOUR FROM NOW() - cl.created_at)::TEXT || ' horas atrás'
+        WHEN cl.created_at > NOW() - INTERVAL '7 days' THEN 
+            EXTRACT(DAY FROM NOW() - cl.created_at)::TEXT || ' dias atrás'
+        ELSE TO_CHAR(cl.created_at, 'DD/MM/YYYY')
+    END AS relative_time
+FROM combined_logs cl
+LEFT JOIN public.company_users cu ON cu.id = cl.changed_by_client
+LEFT JOIN public.supplier_contacts sc ON sc.id = cl.changed_by_supplier
+LEFT JOIN public.order_items oi ON oi.id = cl.order_item_id
+ORDER BY cl.created_at DESC;

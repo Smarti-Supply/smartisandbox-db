@@ -326,7 +326,7 @@ CREATE TABLE public.order_notifications (
     id BIGSERIAL PRIMARY KEY,
     order_id BIGINT NOT NULL,
     order_item_id BIGINT NULL,
-    type TEXT NOT NULL CHECK (type IN ('order_status_change', 'delivery_date_change', 'item_status_change', 'item_invoiced')),
+    type TEXT NOT NULL CHECK (type IN ('order_status_change', 'delivery_date_change', 'item_status_change', 'item_invoiced', 'client_observation', 'client_status_change', 'client_item_change')),
     message TEXT NOT NULL,
     is_read BOOLEAN NOT NULL DEFAULT FALSE,
     created_at TIMESTAMP DEFAULT now() NOT NULL,
@@ -448,7 +448,7 @@ CREATE INDEX idx_followup_suppliers_supplier ON public.followup_suppliers(suppli
 
 -- Criar tabela de logs de follow-up
 CREATE TABLE public.followup_logs (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     company_id BIGINT NOT NULL,
     supplier_id BIGINT NOT NULL,
     supplier_contacts TEXT[] NULL,              -- Contatos do fornecedor (opcional)
@@ -458,7 +458,7 @@ CREATE TABLE public.followup_logs (
     user_observations TEXT NULL,                -- Observações do cliente
     supplier_observations TEXT NULL,            -- Observações do fornecedor
     setting_id BIGINT NULL,                     -- ID da regra que originou o follow-up
-    status TEXT CHECK (status IN ('enviado', 'respondido', 'falha'))NOT NULL DEFAULT 'enviado', -- Status do follow-up
+    status TEXT CHECK (status IN ('enviado', 'respondido', 'falha')) NOT NULL DEFAULT 'enviado', -- Status do follow-up
     notification_type TEXT CHECK (notification_type = 'email') NOT NULL DEFAULT 'email', -- Apenas email é permitido
     created_at TIMESTAMP DEFAULT now() NOT NULL,
     FOREIGN KEY (company_id) REFERENCES public.companies(id) ON DELETE CASCADE,

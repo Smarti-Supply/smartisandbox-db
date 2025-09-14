@@ -1,9 +1,9 @@
 export type ordersPayload = {
-    order_id:     number;
-    order_number: number;
-    items:        number[];
-  };
-  
+  order_id:     number;
+  order_number: number;
+  items:        number[];
+};
+
 export type Entry = {
 user_id:           string;
 supplier_id:       number;

@@ -282,8 +282,8 @@ WHEN (NEW.last_sign_in_at IS DISTINCT FROM OLD.last_sign_in_at)
 EXECUTE FUNCTION private.fn_update_last_login();
 
 
--- ╭─────────────────◉ CONTEXTO: Logs de Pedidos ◉─────────────────────╮
--- ┃               Funções logs de alterações de pedidos                ┃
+-- ╭────────────────◉ CONTEXTO: Alterações de pedidos ◉────────────────╮
+-- ┃                   Funções alterações de pedidos                    ┃
 -- ╰────────────────────────────────────────────────────────────────────╯
 
 -- Criar a função trigger para registrar mudanças na tabela orders
@@ -528,6 +528,67 @@ CREATE TRIGGER trg_propagate_item_update_to_order
 AFTER UPDATE ON public.order_items
 FOR EACH ROW
 EXECUTE FUNCTION private.fn_propagate_item_update_to_order();
+
+
+-- Função para atualizar o status do pedido (Entrega Parcial ou Concluido) com base nos invoices de itens
+CREATE OR REPLACE FUNCTION private.fn_update_order_status_on_invoice()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path TO 'public'
+AS $$
+DECLARE
+  v_order_id BIGINT;
+  v_all_fulfilled BOOLEAN;
+  v_any_delivered BOOLEAN;
+BEGIN
+  -- 1) Descobre o order_id a partir do item faturado
+  SELECT oi.order_id INTO v_order_id
+  FROM public.order_items oi
+  WHERE oi.id = NEW.order_item_id;
+
+  -- 2) Verifica se TODOS os itens foram entregues OU têm status final
+  SELECT bool_and(
+    COALESCE( -- item considerado entregue se soma >= quantidade OU status final
+      delivered.total_quantity >= items.quantity, 
+      FALSE
+    ) OR COALESCE(status.is_final, FALSE)
+  ) AS all_fulfilled,
+  bool_or( -- pelo menos um item parcialmente entregue ou finalizado
+    COALESCE(delivered.total_quantity > 0, FALSE) OR COALESCE(status.is_final, FALSE)
+  ) AS any_delivered
+  INTO v_all_fulfilled, v_any_delivered
+  FROM public.order_items items
+    LEFT JOIN (
+      SELECT order_item_id, SUM(quantity) AS total_quantity
+      FROM public.order_item_invoices
+      GROUP BY order_item_id
+    ) delivered ON delivered.order_item_id = items.id
+    LEFT JOIN public.order_item_status status ON status.id = items.status_id
+  WHERE items.order_id = v_order_id;
+
+  -- 3) Atualiza status do pedido de acordo com as regras
+  IF v_all_fulfilled THEN
+    UPDATE public.orders
+    SET status_id = 5, -- Concluído
+        updated_at = now()
+    WHERE id = v_order_id;
+  ELSIF v_any_delivered THEN
+    UPDATE public.orders
+    SET status_id = 4, -- Entregas Parciais
+        updated_at = now()
+    WHERE id = v_order_id;
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+
+-- Trigger para executar a função após INSERT ou UPDATE
+CREATE TRIGGER trg_update_order_status_on_invoice
+AFTER INSERT ON public.order_item_invoices
+FOR EACH ROW
+EXECUTE FUNCTION private.fn_update_order_status_on_invoice();
 
 
 -- ╭──────────────────────◉ CONTEXTO: Company ◉────────────────────────╮
@@ -788,6 +849,45 @@ BEGIN
         );
       END;
 
+    -- Bucket custom para Transpetro // Remover
+    WHEN 'po-migo-miro-imports' THEN
+      payload := jsonb_build_object(
+        'bucket_id',    NEW.bucket_id,
+        'name',         NEW.name,
+        'owner_id',     NEW.owner_id
+      );
+
+      BEGIN
+        PERFORM net.http_post(
+          url     := aws_api_url || '/process-po-migo-miro-upload',
+          headers := jsonb_build_object(
+                      'Content-Type',   'application/json',
+                      'internal-token',  aws_token,
+                      'x-api-key',       aws_api_key
+                    ),
+          body    := payload
+        );
+        PERFORM private.fn_log_process_event(
+          p_process_name  := 'migo_miro_upload',
+          p_function_name := 'fn_new_file_migo_miro_upload',
+          p_step          := 'po-migo-miro-imports',
+          p_status        := 'success',
+          p_message       := 'Payload enviado com sucesso',
+          p_user_id       := NEW.owner_id::uuid,
+          p_metadata      := payload
+        );
+      EXCEPTION WHEN OTHERS THEN
+        PERFORM private.fn_log_process_event(
+          p_process_name  := 'migo_miro_upload',
+          p_function_name := 'fn_new_file_migo_miro_upload',
+          p_step          := 'po-migo-miro-imports',
+          p_status        := 'error',
+          p_message       := format('Erro ao chamar função de upload: %s', SQLERRM),
+          p_user_id       := NEW.owner_id::uuid,
+          p_metadata      := payload
+        );
+      END;
+
     ELSE
       RAISE LOG 'Bucket % não requer processamento pela trigger', NEW.bucket_id;
   END CASE;
@@ -995,10 +1095,32 @@ SECURITY DEFINER
 SET search_path TO 'public'
 AS $$
 DECLARE
-  v_user_id UUID := (select auth.uid());
+  v_user_id UUID := (SELECT auth.uid());
+  request_source TEXT;
+  supplier_contact_id BIGINT;
+  client_user_id UUID;
 BEGIN
-  -- Verifica autenticação
-  IF v_user_id IS NULL THEN
+  -- Define 'client' como padrão caso request.source não tenha sido definido
+  request_source := COALESCE(current_setting('request.source', true), 'client');
+
+  -- Se for uma requisição do fornecedor, tenta buscar o ID
+  BEGIN
+    IF request_source = 'supplier' THEN
+      supplier_contact_id := current_setting('request.supplier_contact_id', true)::BIGINT;
+    END IF;
+  EXCEPTION WHEN others THEN
+    supplier_contact_id := NULL;
+  END;
+
+  -- Tenta buscar o user_id do request.user_id primeiro, senão usa auth.uid()
+  BEGIN
+    client_user_id := current_setting('request.user_id', true)::UUID;
+  EXCEPTION WHEN others THEN
+    client_user_id := v_user_id;
+  END;
+
+  -- Verifica autenticação (agora usando o client_user_id que pode vir do set_config)
+  IF client_user_id IS NULL THEN
     RAISE EXCEPTION 'Usuário não autenticado.';
   END IF;
 
@@ -1007,9 +1129,10 @@ BEGIN
   NEW.deliver_time := OLD.deliver_time;
 
   -- current_delivery_date e status_id podem ser alterados
+  -- Verifica se é fornecedor usando o client_user_id correto
   IF EXISTS (
     SELECT 1 FROM private.user_access_cache uac
-    WHERE uac.user_id = v_user_id AND uac.role_name = 'fornecedor' AND uac.is_active = true
+    WHERE uac.user_id = client_user_id AND uac.role_name = 'fornecedor' AND uac.is_active = true
   ) THEN
     IF (
       NEW.product IS NOT DISTINCT FROM OLD.product AND
@@ -1029,7 +1152,7 @@ BEGIN
     END IF;
   END IF;
 
-  -- Para não-fornecedores, apenas retorna NEW (ou você pode adicionar outras regras)
+  -- Para não-fornecedores (incluindo processos automatizados), permite todas as alterações
   RETURN NEW;
 END;
 $$;
@@ -1374,3 +1497,207 @@ CREATE TRIGGER trg_notify_supplier_observations_insert
 AFTER INSERT ON public.order_and_item_observations
 FOR EACH ROW
 EXECUTE FUNCTION private.fn_notify_supplier_observations_insert();
+
+-- Criar a função trigger para notificar observações do comprador
+CREATE OR REPLACE FUNCTION private.fn_notify_client_observations_insert()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path TO 'public'
+AS $$
+DECLARE
+    v_request_source TEXT;
+    v_user_id TEXT;
+    v_order_number TEXT;
+    v_item_number BIGINT;
+    v_company_name TEXT;
+BEGIN
+    BEGIN
+        v_request_source := current_setting('request.source', true);
+        v_user_id := current_setting('request.user_id', true);
+    EXCEPTION WHEN OTHERS THEN
+        v_request_source := NULL;
+        v_user_id := NULL;
+    END;
+
+    -- Só executa se for comprador inserindo observações
+    IF v_request_source IS DISTINCT FROM 'client' OR NEW.user_observations IS NULL THEN
+        RETURN NEW;
+    END IF;
+
+    -- Buscar informações do pedido e empresa para a notificação
+    SELECT o.order_number, c.name
+    INTO v_order_number, v_company_name
+    FROM public.orders o
+    JOIN public.companies c ON c.id = o.company_id
+    WHERE o.id = NEW.order_id;
+
+    -- Se for observação de item específico, buscar número do item
+    IF NEW.order_item_id IS NOT NULL THEN
+        SELECT item_number INTO v_item_number
+        FROM public.order_items
+        WHERE id = NEW.order_item_id;
+    END IF;
+
+    -- Inserir notificação
+    INSERT INTO public.order_notifications(order_id, order_item_id, type, message)
+    VALUES (
+        NEW.order_id,
+        NEW.order_item_id,
+        'client_observation',
+        CASE 
+            WHEN v_item_number IS NOT NULL THEN
+                format('Nova observação do comprador %s foi adicionada ao item %s, pedido %s.', 
+                      COALESCE(v_company_name, 'Desconhecido'), 
+                      v_item_number,
+                      COALESCE(v_order_number, NEW.order_id::TEXT))
+            ELSE
+                format('Nova observação do comprador %s foi adicionada ao pedido %s.', 
+                      COALESCE(v_company_name, 'Desconhecido'), 
+                      COALESCE(v_order_number, NEW.order_id::TEXT))
+        END
+    );
+
+    RETURN NEW;
+END;
+$$;
+
+-- Criar o trigger para observações do comprador
+CREATE TRIGGER trg_notify_client_observations_insert
+AFTER INSERT ON public.order_and_item_observations
+FOR EACH ROW
+EXECUTE FUNCTION private.fn_notify_client_observations_insert();
+
+-- Criar a função trigger para notificar mudanças de status do pedido pelo comprador
+CREATE OR REPLACE FUNCTION private.fn_notify_client_order_status_change()
+RETURNS TRIGGER 
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path TO 'public'
+AS $$
+DECLARE
+  v_new_status_name TEXT;
+  v_request_source TEXT;
+  v_company_name TEXT;
+BEGIN
+  BEGIN
+    v_request_source := current_setting('request.source', true);
+  EXCEPTION WHEN OTHERS THEN
+    v_request_source := NULL;
+  END;
+
+  -- Só executa se for comprador
+  IF v_request_source IS DISTINCT FROM 'client' THEN
+    RETURN NEW;
+  END IF;
+
+  IF NEW.status_id IS DISTINCT FROM OLD.status_id AND NEW.status_id IS NOT NULL THEN
+    -- Buscar o nome do novo status
+    SELECT name INTO v_new_status_name
+    FROM public.default_order_status
+    WHERE id = NEW.status_id;
+
+    -- Buscar nome da empresa
+    SELECT c.name INTO v_company_name
+    FROM public.companies c
+    JOIN public.orders o ON o.company_id = c.id
+    WHERE o.id = NEW.id;
+
+    INSERT INTO public.order_notifications(order_id, type, message)
+    VALUES (
+      NEW.id,
+      'client_status_change',
+      format('O status do pedido %s foi alterado para "%s" pelo comprador %s.', 
+             NEW.order_number, 
+             v_new_status_name,
+             COALESCE(v_company_name, 'Desconhecido'))
+    );
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+
+-- Criar o trigger em orders para mudanças do comprador
+CREATE TRIGGER trg_notify_client_order_status_change
+AFTER UPDATE ON public.orders
+FOR EACH ROW
+EXECUTE FUNCTION private.fn_notify_client_order_status_change();
+
+-- Criar a função trigger para notificar mudanças em itens pelo comprador
+CREATE OR REPLACE FUNCTION private.fn_notify_client_item_change() 
+RETURNS TRIGGER 
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path TO 'public'
+AS $$
+DECLARE
+  v_order_number BIGINT;
+  v_request_source TEXT;
+  v_company_name TEXT;
+  v_status_name TEXT;
+  v_changes TEXT[] := '{}';
+BEGIN
+  BEGIN
+    v_request_source := current_setting('request.source', true);
+  EXCEPTION WHEN OTHERS THEN
+    v_request_source := NULL;
+  END;
+
+  -- Só executa se for comprador
+  IF v_request_source IS DISTINCT FROM 'client' THEN
+    RETURN NEW;
+  END IF;
+
+  -- Buscar o número do pedido
+  SELECT order_number INTO v_order_number
+  FROM public.orders
+  WHERE id = NEW.order_id;
+
+  -- Buscar nome da empresa
+  SELECT c.name INTO v_company_name
+  FROM public.companies c
+  JOIN public.orders o ON o.company_id = c.id
+  WHERE o.id = NEW.order_id;
+
+  -- Verificar mudanças e construir mensagem
+  IF NEW.status_id IS DISTINCT FROM OLD.status_id AND NEW.status_id IS NOT NULL THEN
+    SELECT name INTO v_status_name
+    FROM public.order_item_status
+    WHERE id = NEW.status_id;
+    
+    v_changes := array_append(v_changes, format('status alterado para "%s"', v_status_name));
+  END IF;
+
+  IF NEW.due_date IS DISTINCT FROM OLD.due_date THEN
+    v_changes := array_append(v_changes, format('data de vencimento alterada para %s', TO_CHAR(NEW.due_date, 'DD/MM/YYYY')));
+  END IF;
+
+  IF NEW.current_delivery_date IS DISTINCT FROM OLD.current_delivery_date THEN
+    v_changes := array_append(v_changes, format('data de entrega alterada para %s', TO_CHAR(NEW.current_delivery_date, 'DD/MM/YYYY')));
+  END IF;
+
+  -- Inserir notificação se houve mudanças
+  IF array_length(v_changes, 1) > 0 THEN
+    INSERT INTO public.order_notifications(order_id, order_item_id, type, message)
+    VALUES (
+      NEW.order_id,
+      NEW.id,
+      'client_item_change',
+      format('O item %s, pedido %s, teve %s pelo comprador %s.', 
+             NEW.item_number, 
+             v_order_number, 
+             array_to_string(v_changes, ', '),
+             COALESCE(v_company_name, 'Desconhecido'))
+    );
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+
+-- Criar o trigger em order_items para mudanças do comprador
+CREATE TRIGGER trg_notify_client_item_change
+AFTER UPDATE ON public.order_items
+FOR EACH ROW
+EXECUTE FUNCTION private.fn_notify_client_item_change();

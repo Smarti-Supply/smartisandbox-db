@@ -1,6 +1,6 @@
 const allowedOrigins = [
   "https://editor.weweb.io",
-  "https://transpetro.smartisupply.com.br"
+  "https://sandbox.smartisupply.com.br"
 ];
 
 export function getCorsHeaders(origin: string | null): Record<string, string> {
