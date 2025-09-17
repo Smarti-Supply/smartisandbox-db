@@ -3040,6 +3040,15 @@ BEGIN
       ORDER BY fs.company_id, fs.id
   LOOP
       
+      -- Verificar se passou o intervalo mínimo desde o último envio
+      IF setting.last_sent_at IS NOT NULL 
+         AND setting.send_days_interval IS NOT NULL 
+         AND setting.last_sent_at > (NOW() - (setting.send_days_interval || ' days')::INTERVAL) THEN
+          -- Pular esta regra pois ainda não passou o intervalo mínimo
+          v_skipped_rules := v_skipped_rules + 1;
+          CONTINUE;
+      END IF;
+      
       -- Processar cada trigger_scope com suas funções específicas
         IF setting.trigger_scope = 'default_order_status' THEN
             FOR target IN SELECT * FROM private.fn_get_targets_default_order_status(setting.id) LOOP
