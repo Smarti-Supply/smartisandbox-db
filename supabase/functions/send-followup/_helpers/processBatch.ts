@@ -25,6 +25,9 @@ export async function processBatch(entries: Entry[]) {
     }
 
     console.log("📦 Batch pronto para envio:", JSON.stringify(batch, null, 2));
+
+    // Delay de 1.2 segundos antes de chamar Resend API para evitar erro 429
+    await new Promise(resolve => setTimeout(resolve, 1200));
   
     // Envia via Resend
     const batchRes = await fetch("https://api.resend.com/emails/batch", {
