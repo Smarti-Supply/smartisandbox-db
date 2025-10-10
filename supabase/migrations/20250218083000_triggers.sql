@@ -1268,12 +1268,15 @@ BEGIN
     FROM public.default_order_status
     WHERE id = NEW.status_id;
 
-    INSERT INTO public.order_notifications(order_id, type, message)
-    VALUES (
-      NEW.id,
-      'order_status_change',
-      format('O status do pedido %s foi alterado para "%s".', NEW.order_number, v_new_status_name)
-    );
+    -- Só registra notificação se o status não for "Concluído"
+    IF v_new_status_name IS DISTINCT FROM 'Concluído' THEN
+      INSERT INTO public.order_notifications(order_id, type, message)
+      VALUES (
+        NEW.id,
+        'order_status_change',
+        format('O status do pedido %s foi alterado para "%s".', NEW.order_number, v_new_status_name)
+      );
+    END IF;
   END IF;
 
   RETURN NEW;
@@ -1603,15 +1606,18 @@ BEGIN
     JOIN public.orders o ON o.company_id = c.id
     WHERE o.id = NEW.id;
 
-    INSERT INTO public.order_notifications(order_id, type, message)
-    VALUES (
-      NEW.id,
-      'client_status_change',
-      format('O status do pedido %s foi alterado para "%s" pelo comprador %s.', 
-             NEW.order_number, 
-             v_new_status_name,
-             COALESCE(v_company_name, 'Desconhecido'))
-    );
+    -- Só registra notificação se o status não for "Concluído"
+    IF v_new_status_name IS DISTINCT FROM 'Concluído' THEN
+      INSERT INTO public.order_notifications(order_id, type, message)
+      VALUES (
+        NEW.id,
+        'client_status_change',
+        format('O status do pedido %s foi alterado para "%s" pelo comprador %s.', 
+               NEW.order_number, 
+               v_new_status_name,
+               COALESCE(v_company_name, 'Desconhecido'))
+      );
+    END IF;
   END IF;
 
   RETURN NEW;
