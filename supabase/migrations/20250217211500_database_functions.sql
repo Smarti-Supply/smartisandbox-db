@@ -3286,7 +3286,9 @@ CREATE OR REPLACE FUNCTION public.fn_export_table(
   p_supplier_created_dates DATE[] DEFAULT NULL, -- suppliers.created_at
   -- Filtros para order_items
   p_order_ids BIGINT[] DEFAULT NULL, -- order_items.order_id 
-  p_item_created_dates DATE[] DEFAULT NULL, -- order_items.created_at
+  p_item_created_dates DATE[] DEFAULT NULL, -- order_items.created_at (datas exatas)
+  p_item_created_date_start DATE DEFAULT NULL, -- order_items.created_at (período início)
+  p_item_created_date_end DATE DEFAULT NULL, -- order_items.created_at (período fim)
   p_due_dates DATE[] DEFAULT NULL, -- order_items.due_date
   p_delivery_dates DATE[] DEFAULT NULL, -- order_items.current_delivery_date
   p_status_ids INT[] DEFAULT NULL -- order_items.status_id
@@ -3347,6 +3349,13 @@ BEGIN
   
   IF p_status_ids IS NOT NULL AND array_length(p_status_ids, 1) = 0 THEN
     RAISE EXCEPTION 'Array de status_ids não pode estar vazio';
+  END IF;
+  
+  -- Validar parâmetros de período
+  IF p_item_created_date_start IS NOT NULL AND p_item_created_date_end IS NOT NULL THEN
+    IF p_item_created_date_start > p_item_created_date_end THEN
+      RAISE EXCEPTION 'Data de início não pode ser maior que data de fim';
+    END IF;
   END IF;
 
   -- Buscar email e company_id do usuário
@@ -3423,6 +3432,8 @@ BEGIN
         AND (p_supplier_ids IS NULL OR s.id = ANY(p_supplier_ids))
         AND (p_order_ids IS NULL OR oi.order_id = ANY(p_order_ids))
         AND (p_item_created_dates IS NULL OR DATE(oi.created_at) = ANY(p_item_created_dates))
+        AND (p_item_created_date_start IS NULL OR DATE(oi.created_at) >= p_item_created_date_start)
+        AND (p_item_created_date_end IS NULL OR DATE(oi.created_at) <= p_item_created_date_end)
         AND (p_due_dates IS NULL OR oi.due_date = ANY(p_due_dates))
         AND (p_delivery_dates IS NULL OR oi.current_delivery_date = ANY(p_delivery_dates))
         AND (p_status_ids IS NULL OR oi.status_id = ANY(p_status_ids));
