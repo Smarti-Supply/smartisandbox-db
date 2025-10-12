@@ -3274,3 +3274,266 @@ BEGIN
     LEFT JOIN public.supplier_contacts sc ON sc.id = su.supplier_contact_id;
 END;
 $$;
+
+-- Função para exportar dados de tabelas específicas
+CREATE OR REPLACE FUNCTION public.fn_export_table(
+  p_table_name TEXT,
+  p_user_id UUID,
+  -- Filtros para suppliers
+  p_supplier_ids BIGINT[] DEFAULT NULL, -- suppliers.id - funciona para order_items também
+  p_cities TEXT[] DEFAULT NULL, -- suppliers.address_city
+  p_states TEXT[] DEFAULT NULL, -- suppliers.address_state
+  p_supplier_created_dates DATE[] DEFAULT NULL, -- suppliers.created_at
+  -- Filtros para order_items
+  p_order_ids BIGINT[] DEFAULT NULL, -- order_items.order_id 
+  p_item_created_dates DATE[] DEFAULT NULL, -- order_items.created_at
+  p_due_dates DATE[] DEFAULT NULL, -- order_items.due_date
+  p_delivery_dates DATE[] DEFAULT NULL, -- order_items.current_delivery_date
+  p_status_ids INT[] DEFAULT NULL -- order_items.status_id
+)
+RETURNS JSONB
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path TO 'public', 'private', 'vault'
+AS $$
+DECLARE
+  supabase_url TEXT;
+  service_role_key TEXT;
+  edge_token TEXT;
+  user_email TEXT;
+  v_company_id BIGINT;
+  table_data JSONB;
+  payload JSONB;
+  export_id UUID;
+  v_response JSONB;
+BEGIN
+  -- Validar se a tabela é permitida
+  IF p_table_name NOT IN ('suppliers', 'order_items') THEN
+    RAISE EXCEPTION 'Tabela não permitida para exportação: %', p_table_name;
+  END IF;
+
+  -- Validar se arrays não estão vazios quando fornecidos
+  IF p_supplier_ids IS NOT NULL AND array_length(p_supplier_ids, 1) = 0 THEN
+    RAISE EXCEPTION 'Array de supplier_ids não pode estar vazio';
+  END IF;
+  
+  IF p_cities IS NOT NULL AND array_length(p_cities, 1) = 0 THEN
+    RAISE EXCEPTION 'Array de cities não pode estar vazio';
+  END IF;
+  
+  IF p_states IS NOT NULL AND array_length(p_states, 1) = 0 THEN
+    RAISE EXCEPTION 'Array de states não pode estar vazio';
+  END IF;
+  
+  IF p_supplier_created_dates IS NOT NULL AND array_length(p_supplier_created_dates, 1) = 0 THEN
+    RAISE EXCEPTION 'Array de supplier_created_dates não pode estar vazio';
+  END IF;
+  
+  IF p_order_ids IS NOT NULL AND array_length(p_order_ids, 1) = 0 THEN
+    RAISE EXCEPTION 'Array de order_ids não pode estar vazio';
+  END IF;
+  
+  IF p_item_created_dates IS NOT NULL AND array_length(p_item_created_dates, 1) = 0 THEN
+    RAISE EXCEPTION 'Array de item_created_dates não pode estar vazio';
+  END IF;
+  
+  IF p_due_dates IS NOT NULL AND array_length(p_due_dates, 1) = 0 THEN
+    RAISE EXCEPTION 'Array de due_dates não pode estar vazio';
+  END IF;
+  
+  IF p_delivery_dates IS NOT NULL AND array_length(p_delivery_dates, 1) = 0 THEN
+    RAISE EXCEPTION 'Array de delivery_dates não pode estar vazio';
+  END IF;
+  
+  IF p_status_ids IS NOT NULL AND array_length(p_status_ids, 1) = 0 THEN
+    RAISE EXCEPTION 'Array de status_ids não pode estar vazio';
+  END IF;
+
+  -- Buscar email e company_id do usuário
+  SELECT cu.email, cu.company_id
+  INTO user_email, v_company_id
+  FROM public.company_users cu
+  WHERE cu.id = p_user_id;
+
+  IF user_email IS NULL THEN
+    RAISE EXCEPTION 'Usuário não encontrado ou sem empresa associada.';
+  END IF;
+
+  -- Buscar dados da tabela baseado no company_id
+  CASE p_table_name
+    WHEN 'suppliers' THEN
+      SELECT jsonb_agg(
+        jsonb_build_object(
+          'id_fornecedor', s.external_id,
+          'nome', s.name,
+          'cnpj', s.cnpj,
+          'website', s.website,
+          'descricao', s.description,
+          'rua', s.address_street,
+          'endereco_numero', s.address_number,
+          'bairro', s.address_neighborhood,
+          'cidade', s.address_city,
+          'uf', s.address_state,
+          'pais', s.address_country,
+          'cep', s.address_zipcode,
+          'complemento', s.address_complement,
+          'criado_em', s.created_at
+        )
+      )
+      INTO table_data
+      FROM public.suppliers s
+      WHERE s.company_id = v_company_id
+        AND (p_supplier_ids IS NULL OR s.id = ANY(p_supplier_ids))
+        AND (p_cities IS NULL OR s.address_city = ANY(p_cities))
+        AND (p_states IS NULL OR s.address_state = ANY(p_states))
+        AND (p_supplier_created_dates IS NULL OR DATE(s.created_at) = ANY(p_supplier_created_dates));
+
+    WHEN 'order_items' THEN
+      SELECT jsonb_agg(
+        jsonb_build_object(
+          -- Dados do order_item
+          'numero_item', oi.item_number,
+          'produto', oi.product,
+          'descricao_produto', oi.product_description,
+          'quantidade', oi.quantity,
+          'unidade_medida', oi.unity_of_measure,
+          'preco_unitario', oi.unit_price,
+          'preco_total', oi.total_price,
+          'centro', oi.plant,
+          'item_data_da_remessa', oi.due_date,
+          'data_da_entrega', oi.current_delivery_date,
+          'status', ois.name,
+          'item_criado_em', oi.created_at,
+          
+          -- Dados da order relacionada
+          'numero_pedido', o.order_number,
+          'pedido_descricao', o.order_description,
+          'pedido_data_da_remessa', o.due_date,
+          'fornecedor', s.name,
+          'pedido_criado_em', o.created_at,
+          'pedido_atualizado_em', o.updated_at
+        )
+      )
+      INTO table_data
+      FROM public.order_items oi
+      JOIN public.orders o ON o.id = oi.order_id
+      JOIN public.order_item_status ois ON ois.id = oi.status_id
+      JOIN public.suppliers s ON s.id = o.supplier_id
+      WHERE o.company_id = v_company_id
+        AND (p_supplier_ids IS NULL OR s.id = ANY(p_supplier_ids))
+        AND (p_order_ids IS NULL OR oi.order_id = ANY(p_order_ids))
+        AND (p_item_created_dates IS NULL OR DATE(oi.created_at) = ANY(p_item_created_dates))
+        AND (p_due_dates IS NULL OR oi.due_date = ANY(p_due_dates))
+        AND (p_delivery_dates IS NULL OR oi.current_delivery_date = ANY(p_delivery_dates))
+        AND (p_status_ids IS NULL OR oi.status_id = ANY(p_status_ids));
+  END CASE;
+
+  -- Se não há dados, retornar erro
+  IF table_data IS NULL OR jsonb_array_length(table_data) = 0 THEN
+    RAISE EXCEPTION 'Nenhum dado encontrado para exportação na tabela %.', p_table_name;
+  END IF;
+
+  -- Gerar ID único para a operação
+  export_id := gen_random_uuid();
+
+  -- Obter credenciais Supabase do Vault
+  SELECT decrypted_secret INTO service_role_key
+  FROM vault.decrypted_secrets
+  WHERE name = 'SUPABASE_SERVICE_ROLE_KEY';
+
+  SELECT decrypted_secret INTO supabase_url
+  FROM vault.decrypted_secrets
+  WHERE name = 'SUPABASE_URL';
+
+  SELECT decrypted_secret INTO edge_token
+  FROM vault.decrypted_secrets
+  WHERE name = 'EDGE_TOKEN';
+
+  -- Montar payload para edge function
+  payload := jsonb_build_object(
+    'export_id', export_id,
+    'table_name', p_table_name,
+    'data', table_data,
+    'user_id', p_user_id,
+    'company_id', v_company_id,
+    'user_email', user_email
+  );
+
+  -- Chamar edge function
+  BEGIN
+    SELECT net.http_post(
+      url := supabase_url || '/functions/v1/export-data',
+      headers := jsonb_build_object(
+        'Content-Type', 'application/json',
+        'Authorization', 'Bearer ' || service_role_key,
+        'edge-token', edge_token
+      ),
+      body := payload
+    ) INTO v_response;
+
+    -- Verificar status da resposta
+    IF (v_response ->> 'status')::INT >= 400 THEN
+      -- Log de erro
+      PERFORM private.fn_log_process_event(
+        p_process_name := 'data_export',
+        p_function_name := 'fn_export_table',
+        p_step := 'edge_function_call',
+        p_status := 'error',
+        p_message := format('Erro na edge function: %s', v_response ->> 'content'),
+        p_user_id := p_user_id,
+        p_metadata := jsonb_build_object(
+          'export_id', export_id,
+          'table_name', p_table_name,
+          'response', v_response
+        )
+      );
+
+      RAISE EXCEPTION 'Erro na edge function: %', v_response ->> 'content';
+    ELSE
+      -- Log de sucesso
+      PERFORM private.fn_log_process_event(
+        p_process_name := 'data_export',
+        p_function_name := 'fn_export_table',
+        p_step := 'edge_function_call',
+        p_status := 'success',
+        p_message := format('Exportação iniciada com sucesso para tabela %s', p_table_name),
+        p_user_id := p_user_id,
+        p_metadata := jsonb_build_object(
+          'export_id', export_id,
+          'table_name', p_table_name,
+          'data_count', jsonb_array_length(table_data),
+          'response', v_response
+        )
+      );
+    END IF;
+
+  EXCEPTION WHEN OTHERS THEN
+    -- Log de erro
+    PERFORM private.fn_log_process_event(
+      p_process_name := 'data_export',
+      p_function_name := 'fn_export_table',
+      p_step := 'edge_function_call',
+      p_status := 'error',
+      p_message := format('Erro ao chamar edge function: %s', SQLERRM),
+      p_user_id := p_user_id,
+      p_metadata := jsonb_build_object(
+        'export_id', export_id,
+        'table_name', p_table_name,
+        'error', SQLERRM
+      )
+    );
+
+    RAISE EXCEPTION 'Erro ao iniciar exportação: %', SQLERRM;
+  END;
+
+  -- Retornar resultado
+  RETURN jsonb_build_object(
+    'success', true,
+    'export_id', export_id,
+    'table_name', p_table_name,
+    'data_count', jsonb_array_length(table_data),
+    'message', 'Exportação iniciada com sucesso'
+  );
+
+END;
+$$;
