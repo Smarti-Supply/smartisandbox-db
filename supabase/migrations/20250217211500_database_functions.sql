@@ -3235,7 +3235,8 @@ RETURNS TABLE (
     read_by_name TEXT,
     read_by_email TEXT,
     read_by_user_type TEXT,
-    is_from_client BOOLEAN
+    is_from_client BOOLEAN,
+    supplier_id BIGINT
 )
 LANGUAGE plpgsql
 SECURITY DEFINER
@@ -3265,8 +3266,12 @@ BEGIN
         CASE 
             WHEN onf.type IN ('client_observation', 'client_status_change', 'client_item_change') THEN true
             ELSE false
-        END AS is_from_client
+        END AS is_from_client,
+        -- Obter supplier_id através do pedido
+        o.supplier_id
     FROM public.order_notifications onf
+    -- LEFT JOIN para obter supplier_id do pedido
+    LEFT JOIN public.orders o ON o.id = onf.order_id
     -- LEFT JOIN para buscar usuários compradores/admins
     LEFT JOIN public.company_users cu ON cu.id = onf.read_by
     -- LEFT JOIN para buscar usuários fornecedores via supplier_users -> supplier_contacts
