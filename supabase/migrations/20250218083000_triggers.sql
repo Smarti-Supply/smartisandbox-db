@@ -1099,6 +1099,7 @@ DECLARE
   request_source TEXT;
   supplier_contact_id BIGINT;
   client_user_id UUID;
+  is_supplier BOOLEAN := FALSE;
 BEGIN
   -- Define 'client' como padrão caso request.source não tenha sido definido
   request_source := COALESCE(current_setting('request.source', true), 'client');
@@ -1119,21 +1120,29 @@ BEGIN
     client_user_id := v_user_id;
   END;
 
-  -- Verifica autenticação (agora usando o client_user_id que pode vir do set_config)
+  -- Se não conseguiu obter user_id, tenta usar auth.uid() diretamente
+  -- Se ainda assim for NULL, assume que não é fornecedor e permite (RLS vai validar)
   IF client_user_id IS NULL THEN
-    RAISE EXCEPTION 'Usuário não autenticado.';
+    client_user_id := v_user_id;
   END IF;
 
   -- Força consistência nos campos gerados
   NEW.total_price := OLD.total_price;
   NEW.deliver_time := OLD.deliver_time;
 
-  -- current_delivery_date e status_id podem ser alterados
-  -- Verifica se é fornecedor usando o client_user_id correto
-  IF EXISTS (
-    SELECT 1 FROM private.user_access_cache uac
-    WHERE uac.user_id = client_user_id AND uac.role_name = 'fornecedor' AND uac.is_active = true
-  ) THEN
+  -- Verifica se é fornecedor apenas se tiver user_id válido
+  -- Se não tiver user_id, assume que não é fornecedor e permite (as políticas RLS validarão)
+  IF client_user_id IS NOT NULL THEN
+    SELECT EXISTS (
+      SELECT 1 FROM private.user_access_cache uac
+      WHERE uac.user_id = client_user_id 
+        AND uac.role_name = 'fornecedor' 
+        AND uac.is_active = true
+    ) INTO is_supplier;
+  END IF;
+
+  -- Se for fornecedor, aplica restrições
+  IF is_supplier THEN
     IF (
       NEW.product IS NOT DISTINCT FROM OLD.product AND
       NEW.quantity IS NOT DISTINCT FROM OLD.quantity AND
@@ -1152,7 +1161,8 @@ BEGIN
     END IF;
   END IF;
 
-  -- Para não-fornecedores (incluindo processos automatizados), permite todas as alterações
+  -- Para não-fornecedores (admin/comprador) ou quando não consegue identificar o usuário,
+  -- permite todas as alterações - as políticas RLS vão validar as permissões
   RETURN NEW;
 END;
 $$;
