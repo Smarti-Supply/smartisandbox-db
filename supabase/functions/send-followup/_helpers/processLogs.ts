@@ -9,37 +9,9 @@ const supabase = createClient(SUPABASE_URL, SERVICE_ROLE_KEY, {
 });
 
 export async function processLogs(entries: Entry[]): Promise<true | Error> {
-  let hasObservationInsertError = false;
-  let observationInsertError: Error | null = null;
-
   try {
-    for (const entry of entries) {
-      if (entry.orders_payload && entry.user_observations) {
-        const observations = entry.orders_payload.map((p) => ({
-          order_id: p.order_id,
-          user_observations: entry.user_observations,
-          created_by: entry.user_id,
-        }));
-
-        const { error: insertError } = await supabase
-          .schema("public")
-          .from("order_and_item_observations")
-          .insert(observations);
-
-        if (insertError) {
-          hasObservationInsertError = true;
-          observationInsertError = new Error(
-            insertError.message || JSON.stringify(insertError)
-          );
-
-          console.error("⚠️ Erro ao inserir observações:", {
-            order_ids: entry.orders_payload.map((p) => p.order_id),
-            message: insertError.message,
-          });
-
-        }
-      }
-    }
+    // As observações agora são inseridas pela função SQL fn_send_payload_followup
+    // antes do envio do email, então não precisamos mais inserir aqui
 
     const logs = entries.map((e) => ({
       company_id: e.company_id,
@@ -68,19 +40,7 @@ export async function processLogs(entries: Entry[]): Promise<true | Error> {
         hint: logError.hint,
       });
 
-      // Se ambos falharem, retorna um erro que representa os dois
-      if (hasObservationInsertError) {
-        return new Error(
-          `Falha ao inserir observações e logs:\n${observationInsertError?.message}\n${logError.message}`
-        );
-      }
-
       return new Error(logError.message || JSON.stringify(logError));
-    }
-
-    // Se só as observações falharam
-    if (hasObservationInsertError) {
-      return observationInsertError!;
     }
 
     return true;

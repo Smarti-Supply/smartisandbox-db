@@ -1989,6 +1989,11 @@ DECLARE
   html_template_final TEXT;
   v_company_id BIGINT;
   v_uid UUID := (select auth.uid());
+  entry JSONB;
+  order_entry JSONB;
+  order_id_val BIGINT;
+  observations_inserted INT := 0;
+  observations_failed INT := 0;
 BEGIN
   -- Captura company_id da sessão
   SELECT uac.company_id INTO v_company_id
@@ -2190,16 +2195,79 @@ BEGIN
     p_status        := 'success',
     p_message       := format('Payload construído com sucesso para %s fornecedores com %s pedidos.',
                              jsonb_array_length(payload),
-                             (SELECT SUM(jsonb_array_length(entry->'orders_payload')) 
-                              FROM jsonb_array_elements(payload) AS entry)),
+                             (SELECT SUM(jsonb_array_length(e->'orders_payload')) 
+                              FROM jsonb_array_elements(payload) AS e)),
     p_user_id       := v_uid,
     p_metadata      := jsonb_build_object(
                           'total_fornecedores', jsonb_array_length(payload),
-                          'total_pedidos', (SELECT SUM(jsonb_array_length(entry->'orders_payload')) 
-                                           FROM jsonb_array_elements(payload) AS entry),
+                          'total_pedidos', (SELECT SUM(jsonb_array_length(e->'orders_payload')) 
+                                           FROM jsonb_array_elements(payload) AS e),
                           'executado_para_company_id', v_company_id
                       )
   );
+  
+  -- Inserir observações se user_observations estiver presente
+  IF user_observations IS NOT NULL AND TRIM(user_observations) != '' THEN
+    BEGIN
+      observations_inserted := 0;
+      observations_failed := 0;
+      
+      -- Iterar sobre todos os fornecedores no payload
+      FOR entry IN
+        SELECT value FROM jsonb_array_elements(payload)
+      LOOP
+        -- Iterar sobre todos os pedidos de cada fornecedor
+        FOR order_entry IN
+          SELECT value FROM jsonb_array_elements(entry->'orders_payload')
+        LOOP
+          order_id_val := (order_entry->>'order_id')::BIGINT;
+          
+          BEGIN
+            -- Chamar fn_insert_client_observations para cada pedido
+            PERFORM public.fn_insert_client_observations(
+              p_order_id := order_id_val,
+              p_user_observations := user_observations,
+              p_created_by := v_uid,
+              p_order_item_id := NULL
+            );
+            observations_inserted := observations_inserted + 1;
+          EXCEPTION
+            WHEN OTHERS THEN
+              observations_failed := observations_failed + 1;
+              PERFORM private.fn_log_process_event(
+                p_process_name  := 'send_followup_emails',
+                p_function_name := 'fn_send_payload_followup',
+                p_step          := 'insert_observations',
+                p_status        := 'error',
+                p_message       := format('Erro ao inserir observação para pedido %s: %s', order_id_val, SQLERRM),
+                p_user_id       := v_uid,
+                p_metadata      := jsonb_build_object(
+                                      'order_id', order_id_val,
+                                      'company_id', v_company_id
+                                    )
+              );
+          END;
+        END LOOP;
+      END LOOP;
+      
+      -- Log do resultado da inserção de observações
+      IF observations_inserted > 0 THEN
+        PERFORM private.fn_log_process_event(
+          p_process_name  := 'send_followup_emails',
+          p_function_name := 'fn_send_payload_followup',
+          p_step          := 'insert_observations',
+          p_status        := 'success',
+          p_message       := format('Observações inseridas com sucesso: %s pedidos. Falhas: %s.', observations_inserted, observations_failed),
+          p_user_id       := v_uid,
+          p_metadata      := jsonb_build_object(
+                                'observations_inserted', observations_inserted,
+                                'observations_failed', observations_failed,
+                                'company_id', v_company_id
+                              )
+        );
+      END IF;
+    END;
+  END IF;
   
   BEGIN
   -- Disparo do e-mail
