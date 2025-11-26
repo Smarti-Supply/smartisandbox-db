@@ -155,6 +155,17 @@ SELECT
   ) AND dos.code = 'concluido' THEN true  -- Concluído com itens não finais é atrasado
   ELSE CURRENT_DATE > o.due_date
   END AS overdue_order,
+  -- Campo para verificar se o limite máximo de followups foi atingido
+  EXISTS (
+    SELECT 1
+    FROM public.order_items oi
+    JOIN private.followup_item_tracking fit ON fit.order_item_id = oi.id
+    JOIN public.followup_settings fs ON fs.id = fit.setting_id
+    WHERE oi.order_id = o.id
+      AND fs.is_active = true
+      AND fs.max_followups IS NOT NULL
+      AND fit.followup_count >= fs.max_followups
+  ) AS max_followups_reached,
   -- Notificações do fornecedor (para compradores verem)
   EXISTS (
     SELECT 1

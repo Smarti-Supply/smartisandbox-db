@@ -808,7 +808,7 @@ USING (
     FROM private.user_access_cache uac
     WHERE
       uac.user_id = (select auth.uid())
-      AND uac.role_name = 'admin'
+      AND uac.role_name IN ('admin', 'comprador')
       AND uac.is_active = true
       AND uac.company_id = orders.company_id
   )
@@ -819,7 +819,7 @@ WITH CHECK (
     FROM private.user_access_cache uac
     WHERE
       uac.user_id = (select auth.uid())
-      AND uac.role_name = 'admin'
+      AND uac.role_name IN ('admin', 'comprador')
       AND uac.is_active = true
       AND uac.company_id = orders.company_id
   )
