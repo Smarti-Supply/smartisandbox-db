@@ -109,6 +109,7 @@ CREATE OR REPLACE FUNCTION public.fn_create_new_user(
   user_email TEXT,
   user_name TEXT,
   role TEXT,
+  user_password TEXT,
   supplier_letter TEXT, -- Custom field for Transpetro
   supplier_id BIGINT -- Custom field for Transpetro
 )
@@ -143,7 +144,7 @@ BEGIN
   FROM vault.decrypted_secrets
   WHERE name = 'SUPABASE_URL';
 
-  IF user_email IS NULL OR user_name IS NULL OR role IS NULL THEN
+  IF user_email IS NULL OR user_name IS NULL OR role IS NULL OR user_password IS NULL THEN
     RAISE EXCEPTION 'Todos os campos são obrigatórios.';
   END IF;
 
@@ -167,6 +168,7 @@ BEGIN
       'user_email', user_email,
       'user_name',  user_name,
       'role_name',  role,
+      'user_password', user_password,
       'created_by', v_user_id,
       'supplier_letter', COALESCE(supplier_letter, ''), -- Custom field for Transpetro
       'user_supplier_id', supplier_id -- Custom field for Transpetro
@@ -205,7 +207,7 @@ BEGIN
     p_function_name := 'fn_create_new_user',
     p_step          := 'create_new_user',
     p_status        := 'success',
-    p_message       := format('Convite enviado para o e-mail %s.', user_email),
+    p_message       := format('Usuário criado com sucesso para o e-mail %s.', user_email),
     p_user_id       := v_user_id,
     p_metadata      := jsonb_build_object(
                           'email', user_email,
@@ -216,6 +218,102 @@ BEGIN
 END;
 $$;
 
+-- Função para atualizar senha de usuário
+CREATE OR REPLACE FUNCTION public.fn_update_user_password(
+  user_id UUID,
+  new_password TEXT
+)
+RETURNS VOID
+SECURITY DEFINER
+SET search_path TO 'public', 'vault', 'private', 'auth'
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  endpoint TEXT := 'update-user-password';
+  edge_token TEXT;
+  service_role_key TEXT;
+  supabase_url TEXT;
+  v_user_id UUID;
+  v_company_id BIGINT;
+  v_is_active BOOLEAN;
+  v_role_name TEXT;
+  payload JSONB;
+  v_response JSONB;
+  v_uid UUID := (select auth.uid());
+BEGIN
+  SELECT decrypted_secret INTO edge_token
+  FROM vault.decrypted_secrets
+  WHERE name = 'INTERNAL_EDGE_TOKEN';
+
+  SELECT decrypted_secret INTO service_role_key
+  FROM vault.decrypted_secrets
+  WHERE name = 'SUPABASE_SERVICE_ROLE_KEY';
+
+  SELECT decrypted_secret INTO supabase_url
+  FROM vault.decrypted_secrets
+  WHERE name = 'SUPABASE_URL';
+
+  IF user_id IS NULL OR new_password IS NULL THEN
+    RAISE EXCEPTION 'ID do usuário e nova senha são obrigatórios.';
+  END IF;
+  
+  SELECT uac.user_id, uac.company_id, uac.is_active, uac.role_name
+  INTO v_user_id, v_company_id, v_is_active, v_role_name
+  FROM private.user_access_cache uac
+  WHERE uac.user_id = v_uid
+    AND uac.is_active = true
+  LIMIT 1;
+
+  IF NOT (v_is_active AND v_role_name = 'admin') THEN
+    RAISE EXCEPTION 'Apenas administradores ativos podem atualizar senhas de usuários.';
+  END IF;
+
+  payload := jsonb_build_object(
+      'user_id', user_id,
+      'new_password', new_password
+  );
+
+  SELECT net.http_post(
+      url     := supabase_url || '/functions/v1/' || endpoint,
+      headers := jsonb_build_object(
+        'Content-Type',  'application/json',
+        'Authorization', 'Bearer ' || service_role_key,
+        'edge-token',    edge_token
+      ),
+      body := payload
+    ) INTO v_response;
+
+  -- Verificar se houve erro na chamada
+  IF (v_response ->> 'status')::INT >= 400 THEN
+    PERFORM private.fn_log_process_event(
+      p_process_name  := 'update_user_password',
+      p_function_name := 'fn_update_user_password',
+      p_step          := 'edge_call',
+      p_status        := 'error',
+      p_message       := 'Falha ao chamar edge function.',
+      p_user_id       := v_user_id,
+      p_metadata      := jsonb_build_object(
+                            'status', v_response ->> 'status',
+                            'body',   v_response ->> 'body'
+                          )
+    );
+    RAISE EXCEPTION 'Erro ao chamar edge function: %', v_response ->> 'body';
+  END IF;
+
+  -- Sucesso na atualização da senha
+  PERFORM private.fn_log_process_event(
+    p_process_name  := 'update_user_password',
+    p_function_name := 'fn_update_user_password',
+    p_step          := 'update_user_password',
+    p_status        := 'success',
+    p_message       := format('Senha atualizada com sucesso para o usuário %s.', user_id),
+    p_user_id       := v_user_id,
+    p_metadata      := jsonb_build_object(
+                          'user_id', user_id
+                        )
+  );
+END;
+$$;
 
 -- Função para excluir usuários inativos
 CREATE OR REPLACE FUNCTION private.fn_delete_inactive_auth_users()
