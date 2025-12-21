@@ -3833,7 +3833,8 @@ BEGIN
       'numero_item', oi.item_number,
       'observacao_do_usuario', oao.user_observations,
       'observacao_do_fornecedor', oao.supplier_observations,
-      'data_da_entrega', oao.current_delivery_date
+      'data_da_entrega', oao.current_delivery_date,
+      'criado_em', oao.created_at
     )
   ), '[]'::jsonb)
   INTO observations_data
