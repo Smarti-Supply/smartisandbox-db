@@ -3826,6 +3826,7 @@ BEGIN
 
   -- Buscar order_and_item_observations
   -- Substituir order_item_id por numero_item (fazer JOIN com order_items)
+  -- Incluir usuario_nome e usuario_email via JOIN com company_users OU supplier_users
   SELECT COALESCE(jsonb_agg(
     jsonb_build_object(
       'id', oao.id,
@@ -3834,34 +3835,56 @@ BEGIN
       'observacao_do_usuario', oao.user_observations,
       'observacao_do_fornecedor', oao.supplier_observations,
       'data_da_entrega', oao.current_delivery_date,
-      'criado_em', oao.created_at
+      'criado_em', oao.created_at,
+      'usuario_nome', COALESCE(cu.name, sc.name),
+      'usuario_email', COALESCE(cu.email, sc.email)
     )
   ), '[]'::jsonb)
   INTO observations_data
   FROM public.order_and_item_observations oao
   LEFT JOIN public.order_items oi ON oi.id = oao.order_item_id
+  LEFT JOIN public.company_users cu ON cu.id = oao.created_by
+  LEFT JOIN public.supplier_users su ON su.id = oao.created_by
+  LEFT JOIN public.supplier_contacts sc ON sc.id = su.supplier_contact_id
   WHERE oao.order_id = p_order_id;
 
   -- Buscar followup_item_tracking com rule_name
   -- Usar company_id diretamente da tabela followup_item_tracking
   -- Substituir order_item_id por numero_item
+  -- Obter usuario_nome e usuario_email via order_item_logs (log de mudança de status mais recente)
+  -- Pode ser company_users OU supplier_contacts
   SELECT COALESCE(jsonb_agg(
     jsonb_build_object(
       'id', fit.id,
       'id_pedido', fit.order_id,
       'numero_item', oi.item_number,
-      'regras_de_followup', fs.rule_name,
-      'criado_em', fit.created_at
+      'regras_de_followup', COALESCE(fs.rule_name, 'Regra não encontrada'),
+      'criado_em', fit.created_at,
+      'usuario_nome', COALESCE(cu.name, sc.name),
+      'usuario_email', COALESCE(cu.email, sc.email)
     )
   ), '[]'::jsonb)
   INTO followup_tracking_data
   FROM private.followup_item_tracking fit
   JOIN public.order_items oi ON oi.id = fit.order_item_id
   LEFT JOIN public.followup_settings fs ON fs.id = fit.setting_id
+  LEFT JOIN LATERAL (
+    -- Buscar o log de mudança de status mais recente para este item
+    SELECT oil.changed_by_client, oil.changed_by_supplier
+    FROM public.order_item_logs oil
+    WHERE oil.order_item_id = fit.order_item_id
+      AND oil.new_status_id IS NOT NULL
+      AND oil.old_status_id IS DISTINCT FROM oil.new_status_id
+    ORDER BY oil.created_at DESC
+    LIMIT 1
+  ) oil_recent ON true
+  LEFT JOIN public.company_users cu ON cu.id = oil_recent.changed_by_client
+  LEFT JOIN public.supplier_contacts sc ON sc.id = oil_recent.changed_by_supplier
   WHERE fit.order_id = p_order_id
     AND fit.company_id = v_company_id;
 
   -- Buscar order_item_invoices relacionadas aos order_items do pedido
+  -- Incluir usuario_nome e usuario_email via JOIN com company_users OU supplier_users
   SELECT COALESCE(jsonb_agg(
     jsonb_build_object(
       'id', oii.id,
@@ -3871,12 +3894,17 @@ BEGIN
       'quantidade_faturada', oii.quantity,
       'valor_faturado', oii.invoiced_value,
       'volumes', oii.volumes,
-      'criado_em', oii.created_at
+      'criado_em', oii.created_at,
+      'usuario_nome', COALESCE(cu.name, sc.name),
+      'usuario_email', COALESCE(cu.email, sc.email)
     )
   ), '[]'::jsonb)
   INTO order_item_invoices_data
   FROM public.order_item_invoices oii
   JOIN public.order_items oi ON oi.id = oii.order_item_id
+  LEFT JOIN public.company_users cu ON cu.id = oii.created_by
+  LEFT JOIN public.supplier_users su ON su.id = oii.created_by
+  LEFT JOIN public.supplier_contacts sc ON sc.id = su.supplier_contact_id
   WHERE oi.order_id = p_order_id;
 
   -- Combinar os dados
