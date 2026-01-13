@@ -562,7 +562,7 @@ BEGIN
             WHEN record ? 'dt_recebimento'
                 AND record->>'dt_recebimento' IS DISTINCT FROM 'null'
                 AND record->>'dt_recebimento' <> ''
-            THEN (record->>'dt_recebimento')::DATE
+            THEN (LEFT(record->>'dt_recebimento', 10))::DATE + INTERVAL '1 day'
             ELSE NULL
         END;
 
@@ -570,7 +570,7 @@ BEGIN
             WHEN record ? 'data_fatura'
                 AND record->>'data_fatura' IS DISTINCT FROM 'null'
                 AND record->>'data_fatura' <> ''
-            THEN (record->>'data_fatura')::DATE
+            THEN (LEFT(record->>'data_fatura', 10))::DATE + INTERVAL '1 day'
             ELSE NULL
         END;
 
@@ -578,7 +578,7 @@ BEGIN
             WHEN record ? 'data_pagto'
                 AND record->>'data_pagto' IS DISTINCT FROM 'null'
                 AND record->>'data_pagto' <> ''
-            THEN (record->>'data_pagto')::DATE
+            THEN (LEFT(record->>'data_pagto', 10))::DATE + INTERVAL '1 day'
             ELSE NULL
         END;
 
