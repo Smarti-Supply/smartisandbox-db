@@ -148,11 +148,6 @@ SELECT
     JOIN public.order_item_status ois ON oi.status_id = ois.id
     WHERE oi.order_id = o.id AND ois.is_final = FALSE
   ) THEN false  -- Se todos os itens são finais, nunca é atrasado
-  WHEN EXISTS (
-    SELECT 1 FROM public.order_items oi
-    JOIN public.order_item_status ois ON oi.status_id = ois.id
-    WHERE oi.order_id = o.id AND ois.is_final = FALSE
-  ) AND dos.code = 'concluido' THEN true  -- Concluído com itens não finais é atrasado
   ELSE CURRENT_DATE > o.due_date
   END AS overdue_order,
   -- Campo para verificar se o limite máximo de followups foi atingido
@@ -297,6 +292,7 @@ WHERE
         )
     )
 LIMIT 1000;
+
 
 -- Criar view para listar os usuários do sistema
 CREATE OR REPLACE VIEW public.view_company_users_with_supplier_letter
