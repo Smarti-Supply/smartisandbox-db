@@ -30,11 +30,15 @@ Deno.serve(async (req) => {
     console.log('  - id_pedido:', payload.id_pedido);
     console.log('  - observations count:', payload.observations?.length || 0);
     console.log('  - followup_tracking count:', payload.followup_tracking?.length || 0);
+    console.log('  - followup_logs count:', payload.followup_logs?.length || 0);
     if (payload.observations && payload.observations.length > 0) {
       console.log('  - Primeira observation:', JSON.stringify(payload.observations[0], null, 2));
     }
     if (payload.followup_tracking && payload.followup_tracking.length > 0) {
       console.log('  - Primeiro followup_tracking:', JSON.stringify(payload.followup_tracking[0], null, 2));
+    }
+    if (payload.followup_logs && payload.followup_logs.length > 0) {
+      console.log('  - Primeiro followup_logs:', JSON.stringify(payload.followup_logs[0], null, 2));
     }
     
     const validatedPayload = validatePayload(payload);
@@ -42,6 +46,7 @@ Deno.serve(async (req) => {
     console.log('📊 Detalhes após validação:');
     console.log('  - observations count:', validatedPayload.observations.length);
     console.log('  - followup_tracking count:', validatedPayload.followup_tracking.length);
+    console.log('  - followup_logs count:', validatedPayload.followup_logs.length);
     
     // Usar validatedPayload diretamente - o tipo já está correto do validatePayload
     const payloadData = validatedPayload;
@@ -77,6 +82,7 @@ Deno.serve(async (req) => {
       order_items: p.order_items,
       observations: p.observations,
       followup_tracking: p.followup_tracking,
+      followup_logs: p.followup_logs,
       order_item_invoices: p.order_item_invoices,
       user_id: p.user_id,
       company_id: p.company_id,
@@ -131,6 +137,7 @@ Deno.serve(async (req) => {
           order_items_count: (pForLog.order_items as unknown[]).length,
           observations_count: (pForLog.observations as unknown[]).length,
           followup_tracking_count: (pForLog.followup_tracking as unknown[]).length,
+          followup_logs_count: (pForLog.followup_logs as unknown[]).length,
           order_item_invoices_count: (pForLog.order_item_invoices as unknown[]).length,
           aws_response: awsResult
         }
@@ -148,6 +155,7 @@ Deno.serve(async (req) => {
       order_items_count: (pForResponse.order_items as unknown[]).length,
       observations_count: (pForResponse.observations as unknown[]).length,
       followup_tracking_count: (pForResponse.followup_tracking as unknown[]).length,
+      followup_logs_count: (pForResponse.followup_logs as unknown[]).length,
       order_item_invoices_count: (pForResponse.order_item_invoices as unknown[]).length
     } as ExportResponse;
 

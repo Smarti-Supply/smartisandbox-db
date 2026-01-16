@@ -3741,6 +3741,7 @@ DECLARE
   order_items_data JSONB;
   observations_data JSONB;
   followup_tracking_data JSONB;
+  followup_logs_data JSONB;
   order_item_invoices_data JSONB;
   combined_data JSONB;
   payload JSONB;
@@ -3883,6 +3884,37 @@ BEGIN
   WHERE fit.order_id = p_order_id
     AND fit.company_id = v_company_id;
 
+  -- Buscar followup_logs relacionados ao pedido
+  -- Filtrar onde orders_payload contém um objeto com order_id igual ao p_order_id
+  -- Incluir rule_name da tabela followup_settings
+  SELECT COALESCE(jsonb_agg(
+    jsonb_build_object(
+      'id', fl.id,
+      'supplier_id', fl.supplier_id,
+      'supplier_contacts', fl.supplier_contacts,
+      'sent_at', fl.sent_at,
+      'sent_by', CASE WHEN fl.sent_by IS NULL THEN '' ELSE fl.sent_by::TEXT END,
+      'user_observations', fl.user_observations,
+      'supplier_observations', fl.supplier_observations,
+      'setting_id', fl.setting_id,
+      'rule_name', COALESCE(fs.rule_name, NULL),
+      'status', fl.status,
+      'notification_type', fl.notification_type,
+      'created_at', fl.created_at,
+      'is_automatic', CASE WHEN fl.sent_by IS NULL THEN true ELSE false END
+    )
+    ORDER BY fl.sent_at DESC
+  ), '[]'::jsonb)
+  INTO followup_logs_data
+  FROM public.followup_logs fl
+  LEFT JOIN public.followup_settings fs ON fs.id = fl.setting_id
+  WHERE fl.company_id = v_company_id
+    AND EXISTS (
+      SELECT 1
+      FROM jsonb_array_elements(fl.orders_payload) AS order_entry
+      WHERE (order_entry->>'order_id')::BIGINT = p_order_id
+    );
+
   -- Buscar order_item_invoices relacionadas aos order_items do pedido
   -- Incluir usuario_nome e usuario_email via JOIN com company_users OU supplier_users
   SELECT COALESCE(jsonb_agg(
@@ -3938,6 +3970,7 @@ BEGIN
     'order_items', order_items_data,
     'observations', observations_data,
     'followup_tracking', followup_tracking_data,
+    'followup_logs', COALESCE(followup_logs_data, '[]'::jsonb),
     'order_item_invoices', COALESCE(order_item_invoices_data, '[]'::jsonb),
     'user_id', p_user_id,
     'company_id', v_company_id,
@@ -3989,6 +4022,7 @@ BEGIN
           'order_items_count', jsonb_array_length(order_items_data),
           'observations_count', jsonb_array_length(observations_data),
           'followup_tracking_count', jsonb_array_length(followup_tracking_data),
+          'followup_logs_count', jsonb_array_length(COALESCE(followup_logs_data, '[]'::jsonb)),
           'response', v_response
         )
       );
@@ -4021,6 +4055,7 @@ BEGIN
     'order_items_count', jsonb_array_length(order_items_data),
     'observations_count', jsonb_array_length(observations_data),
     'followup_tracking_count', jsonb_array_length(followup_tracking_data),
+    'followup_logs_count', jsonb_array_length(COALESCE(followup_logs_data, '[]'::jsonb)),
     'order_item_invoices_count', jsonb_array_length(COALESCE(order_item_invoices_data, '[]'::jsonb)),
     'message', 'Exportação iniciada com sucesso'
   );

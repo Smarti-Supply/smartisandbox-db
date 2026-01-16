@@ -33,6 +33,10 @@ export function validatePayload(payload: unknown): OrderDetailsPayload {
     throw new Error('followup_tracking é obrigatório e deve ser um array');
   }
 
+  if (!Array.isArray(p.followup_logs)) {
+    throw new Error('followup_logs é obrigatório e deve ser um array');
+  }
+
   if (!Array.isArray(p.order_item_invoices)) {
     throw new Error('order_item_invoices é obrigatório e deve ser um array');
   }
@@ -62,6 +66,7 @@ export function validatePayload(payload: unknown): OrderDetailsPayload {
     order_items: p.order_items as Record<string, unknown>[],
     observations: p.observations as Record<string, unknown>[],
     followup_tracking: p.followup_tracking as Record<string, unknown>[],
+    followup_logs: p.followup_logs as Record<string, unknown>[],
     order_item_invoices: p.order_item_invoices as Record<string, unknown>[],
     user_id: p.user_id,
     company_id: p.company_id,
