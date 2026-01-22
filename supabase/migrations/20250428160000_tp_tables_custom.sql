@@ -293,7 +293,6 @@ WHERE
     )
 LIMIT 1000;
 
-
 -- Criar view para listar os usuários do sistema
 CREATE OR REPLACE VIEW public.view_company_users_with_supplier_letter
 WITH (security_invoker = true)

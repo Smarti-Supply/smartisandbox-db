@@ -103,6 +103,7 @@ Deno.serve(async (req) => {
         status: "success",
         message: `Exportação processada com sucesso para tabela ${validatedPayload.table_name}`,
         user_id: validatedPayload.user_id,
+        order_id: null,
         metadata: {
           export_id: validatedPayload.export_id,
           table_name: validatedPayload.table_name,
@@ -146,6 +147,7 @@ Deno.serve(async (req) => {
           status: "error",
           message: message,
           user_id: null,
+          order_id: null,
           metadata: { error: message }
         });
     } catch (logError) {

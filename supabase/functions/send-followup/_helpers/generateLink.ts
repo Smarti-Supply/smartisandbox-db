@@ -1,4 +1,4 @@
-import { createClient } from "supabase";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { buildHtmlBlocks } from "../_helpers/buildHtmlBlocks.ts";
 import { renderHtml } from "../_helpers/renderHtml.ts";
 import type { Entry } from "../_helpers/types.ts";

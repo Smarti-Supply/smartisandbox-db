@@ -11,7 +11,8 @@ CREATE OR REPLACE FUNCTION public.fn_log_process_event(
   p_message TEXT,
   p_user_id UUID,
   p_metadata JSONB,
-  token TEXT
+  token TEXT,
+  p_order_id BIGINT DEFAULT NULL
 )
 RETURNS VOID
 LANGUAGE plpgsql
@@ -37,7 +38,8 @@ BEGIN
     p_status,
     p_message,
     p_user_id,
-    p_metadata
+    p_metadata,
+    p_order_id
   );
 END;
 $$;
@@ -50,7 +52,8 @@ CREATE OR REPLACE FUNCTION private.fn_log_process_event(
   p_status TEXT,
   p_message TEXT,
   p_user_id UUID,
-  p_metadata JSONB DEFAULT NULL
+  p_metadata JSONB DEFAULT NULL,
+  p_order_id BIGINT DEFAULT NULL
 )
 RETURNS VOID
 LANGUAGE plpgsql
@@ -65,6 +68,7 @@ BEGIN
     status,
     message,
     user_id,
+    order_id,
     metadata,
     created_at
   )
@@ -75,6 +79,7 @@ BEGIN
     p_status,
     p_message,
     p_user_id,
+    p_order_id,
     p_metadata,
     now()
   );
@@ -218,6 +223,7 @@ BEGIN
 END;
 $$;
 
+
 -- Função para atualizar senha de usuário
 CREATE OR REPLACE FUNCTION public.fn_update_user_password(
   user_id UUID,
@@ -314,6 +320,7 @@ BEGIN
   );
 END;
 $$;
+
 
 -- Função para excluir usuários inativos
 CREATE OR REPLACE FUNCTION private.fn_delete_inactive_auth_users()
@@ -3209,6 +3216,7 @@ BEGIN
       -- Verificar se passou o intervalo mínimo desde o último envio
       IF setting.last_sent_at IS NOT NULL 
          AND setting.send_days_interval IS NOT NULL 
+         AND setting.send_days_interval > 0
          AND setting.last_sent_at > (NOW() - (setting.send_days_interval || ' days')::INTERVAL) THEN
           -- Pular esta regra pois ainda não passou o intervalo mínimo
           v_skipped_rules := v_skipped_rules + 1;
@@ -3316,6 +3324,141 @@ BEGIN
               AND status IN ('pendente', 'enviando')
         );
     END IF;
+END;
+$$;
+
+-- Função para processar fila com retry exponencial e controle de falhas.
+CREATE OR REPLACE FUNCTION private.fn_process_followup_queue(p_batch_size INT DEFAULT 50)
+RETURNS TABLE (
+  processed INT,
+  success INT,
+  failed INT,
+  retrying INT
+)
+SECURITY DEFINER
+SET search_path TO 'public', 'private'
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  q RECORD;
+  v_processed INT := 0;
+  v_success INT := 0;
+  v_failed INT := 0;
+  v_retrying INT := 0;
+  v_next_retry TIMESTAMP;
+BEGIN
+  FOR q IN
+      SELECT fq.*, fs.email_template, fs.max_followups
+      FROM private.followup_queue fq
+      JOIN public.followup_settings fs ON fs.id = fq.setting_id
+      WHERE fq.status IN ('pendente', 'falha')
+        AND (fq.next_try_at IS NULL OR fq.next_try_at <= NOW())
+        AND fq.tentativa < COALESCE(fq.max_tentativas, 3)
+      ORDER BY fq.created_at, fq.tentativa
+      LIMIT p_batch_size
+  LOOP
+      BEGIN
+          -- Marcar como enviando
+          UPDATE private.followup_queue
+          SET
+              status = 'enviando',
+              last_try_at = NOW(),
+              tentativa = tentativa + 1,
+              updated_at = NOW()
+          WHERE id = q.id;
+
+
+          -- Enviar follow-up usando função existente
+          PERFORM private.fn_send_payload_followup_cron(
+              p_company_id := q.company_id,
+              supplier_ids := ARRAY[q.supplier_id],
+              order_ids := q.order_ids,
+              template_html := q.email_template,
+              setting_id := q.setting_id
+          );
+
+
+          -- Atualizar contadores de follow-up por item
+          PERFORM private.fn_update_followup_counters(q.setting_id, q.order_ids);
+
+
+          -- Marcar como sucesso
+          UPDATE private.followup_queue
+          SET
+              status = 'sucesso',
+              updated_at = NOW(),
+              error_message = NULL
+          WHERE id = q.id;
+
+
+          v_success := v_success + 1;
+
+
+      EXCEPTION WHEN OTHERS THEN
+          -- Calcular próxima tentativa (backoff exponencial)
+          v_next_retry := NOW() + (POWER(2, q.tentativa) || ' minutes')::INTERVAL;
+
+
+          -- Verificar se excedeu máximo de tentativas
+          IF q.tentativa >= COALESCE(q.max_tentativas, 3) THEN
+              UPDATE followup_queue
+              SET
+                  status = 'falha',
+                  error_message = SQLERRM,
+                  updated_at = NOW()
+              WHERE id = q.id;
+              v_failed := v_failed + 1;
+          ELSE
+              UPDATE private.followup_queue
+              SET
+                  status = 'falha',
+                  next_try_at = v_next_retry,
+                  error_message = SQLERRM,
+                  updated_at = NOW()
+              WHERE id = q.id;
+              v_retrying := v_retrying + 1;
+          END IF;
+      END;
+
+
+      v_processed := v_processed + 1;
+  END LOOP;
+
+  RETURN QUERY SELECT v_processed, v_success, v_failed, v_retrying;
+END;
+$$;
+
+-- Função para manter a fila limpa removendo registros antigos.
+CREATE OR REPLACE FUNCTION private.fn_cleanup_followup_queue()
+RETURNS TABLE (
+    deleted_success INT,
+    deleted_failed INT,
+    total_deleted INT
+)
+SECURITY DEFINER
+SET search_path TO 'public', 'private'
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_deleted_success INT;
+    v_deleted_failed INT;
+BEGIN
+    -- Remove itens com sucesso (mais de 7 dias)
+    DELETE FROM private.followup_queue
+    WHERE status = 'sucesso'
+    AND updated_at < NOW() - INTERVAL '7 days';
+    
+    GET DIAGNOSTICS v_deleted_success = ROW_COUNT;
+    
+    -- Remove falhas definitivas antigas (mais de 30 dias)
+    DELETE FROM private.followup_queue
+    WHERE status = 'falha'
+    AND (next_try_at IS NULL OR tentativa >= max_tentativas)
+    AND updated_at < NOW() - INTERVAL '30 days';
+    
+    GET DIAGNOSTICS v_deleted_failed = ROW_COUNT;
+    
+    RETURN QUERY SELECT v_deleted_success, v_deleted_failed, (v_deleted_success + v_deleted_failed);
 END;
 $$;
 

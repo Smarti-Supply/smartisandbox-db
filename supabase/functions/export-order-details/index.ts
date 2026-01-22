@@ -131,9 +131,9 @@ Deno.serve(async (req) => {
         status: "success",
         message: `Exportação processada com sucesso para pedido ${pForLog.id_pedido}`,
         user_id: pForLog.user_id,
+        order_id: pForLog.id_pedido,
         metadata: {
           export_id: pForLog.export_id,
-          id_pedido: pForLog.id_pedido,
           order_items_count: (pForLog.order_items as unknown[]).length,
           observations_count: (pForLog.observations as unknown[]).length,
           followup_tracking_count: (pForLog.followup_tracking as unknown[]).length,
@@ -183,6 +183,7 @@ Deno.serve(async (req) => {
           status: "error",
           message: message,
           user_id: null,
+          order_id: null,
           metadata: { error: message }
         });
     } catch (logError) {

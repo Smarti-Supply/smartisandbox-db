@@ -1,11 +1,10 @@
-import { createClient } from "supabase";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { getCorsHeaders } from "../_shared/cors.ts";
 
 // Variáveis de ambiente
 const INTERNAL_EDGE_TOKEN = Deno.env.get("INTERNAL_EDGE_TOKEN")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
-const RESET_PASSWORD_URL = Deno.env.get("RESET_PASSWORD_URL")!;
 
 // Instância do Supabase com SERVICE_ROLE
 const supabase = createClient(SUPABASE_URL, SERVICE_ROLE_KEY, {
@@ -29,18 +28,20 @@ Deno.serve(async (req: Request): Promise<Response> => {
   }
 
   const body = await req.json();
-  const { company_id, user_email, user_name, role_name, created_by, supplier_letter, user_supplier_id } = body;
+  const { company_id, user_email, user_name, role_name, user_password, created_by, supplier_letter, user_supplier_id } = body;
 
-  if (!user_email || !user_name || !role_name || !company_id || !created_by) {
+  if (!user_email || !user_name || !role_name || !user_password || !company_id || !created_by) {
     return new Response(
       JSON.stringify({ error: "Campos obrigatórios ausentes." }),
       { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
     );
   }
 
-  const { data, error } = await supabase.auth.admin.inviteUserByEmail(user_email, {
-      redirectTo: RESET_PASSWORD_URL,
-      data: {
+  // Criar usuário primeiro sem senha (ou com senha temporária)
+  const { data: createData, error: createError } = await supabase.auth.admin.createUser({
+    email: user_email,
+    email_confirm: true,
+    user_metadata: {
       company_id,
       user_email,
       user_name,
@@ -52,14 +53,31 @@ Deno.serve(async (req: Request): Promise<Response> => {
     },
   });
 
-  if (error) {
-    return new Response(JSON.stringify({ error: error.message }), {
+  if (createError || !createData?.user) {
+    return new Response(JSON.stringify({ error: createError?.message || "Erro ao criar usuário" }), {
       status: 500,
       headers: { ...corsHeaders, "Content-Type": "application/json" },
     });
   }
 
-  return new Response(JSON.stringify({ user: data?.user }), {
+  // Atualizar a senha explicitamente após criar o usuário
+  const { data: updateData, error: updateError } = await supabase.auth.admin.updateUserById(
+    createData.user.id,
+    {
+      password: user_password,
+    }
+  );
+
+  if (updateError) {
+    // Se falhar ao atualizar senha, tenta deletar o usuário criado
+    await supabase.auth.admin.deleteUser(createData.user.id);
+    return new Response(JSON.stringify({ error: `Erro ao definir senha: ${updateError.message}` }), {
+      status: 500,
+      headers: { ...corsHeaders, "Content-Type": "application/json" },
+    });
+  }
+
+  return new Response(JSON.stringify({ user: updateData?.user || createData?.user }), {
     status: 200,
     headers: { ...corsHeaders, "Content-Type": "application/json" },
   });

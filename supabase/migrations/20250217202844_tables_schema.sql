@@ -11,6 +11,7 @@ CREATE TABLE private.process_logs (
     status TEXT NOT NULL,             -- ex: 'success' | 'error' | 'info'
     message TEXT,                     -- texto livre com erro, descrição, etc
     user_id UUID NULL,                -- usuário relacionado ao processo
+    order_id BIGINT NULL,             -- order relacionado ao processo (se aplicável)
     metadata JSONB,                   -- opcional: dados adicionais úteis pro debug
     created_at TIMESTAMP DEFAULT now()
 );
@@ -241,6 +242,13 @@ CREATE INDEX idx_orders_supplier ON public.orders(supplier_id);
 CREATE INDEX idx_orders_status ON public.orders(status_id);
 CREATE INDEX idx_orders_order_number ON public.orders(order_number);
 CREATE INDEX idx_orders_company_supplier ON public.orders(company_id, supplier_id);
+
+-- Adicionar foreign key e índice para process_logs.order_id (após tabela orders ser criada)
+ALTER TABLE private.process_logs
+    ADD CONSTRAINT process_logs_order_id_fkey
+    FOREIGN KEY (order_id) REFERENCES public.orders(id) ON DELETE SET NULL;
+
+CREATE INDEX idx_process_logs_order_id ON private.process_logs(order_id);
 
 
 -- Criar tabela para registrar alterações na tabela orders

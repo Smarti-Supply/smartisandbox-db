@@ -1,5 +1,5 @@
-import { createClient } from "supabase";
-import * as XLSX from "xlsx";
+import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import * as XLSX from "https://esm.sh/xlsx@0.18.5";
 import { getCorsHeaders } from "../_shared/cors.ts";
 
 Deno.serve(async (req) => {

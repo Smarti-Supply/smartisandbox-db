@@ -189,6 +189,7 @@ pl.step,
 pl.status,
 pl.message,
 pl.user_id,
+pl.order_id,
 pl.metadata,
 pl.created_at,
 CASE pl.process_name
@@ -210,9 +211,12 @@ CASE pl.status
     ELSE pl.status
 END AS status_label,
 cu.name  AS user_name,
-cu.email AS user_email
+cu.email AS user_email,
+o.order_number,
+o.order_description
 FROM private.process_logs pl
-LEFT JOIN public.company_users cu ON cu.id = pl.user_id;
+LEFT JOIN public.company_users cu ON cu.id = pl.user_id
+LEFT JOIN public.orders o ON o.id = pl.order_id;
 
 
 -- Criar view para listar os fornecedores
