@@ -1,6 +1,8 @@
 {
   "imports": {
-    "supabase": "jsr:@supabase/supabase-js@2"
+    "supabase": "jsr:@supabase/supabase-js@2",
+    "jspdf": "npm:jspdf@2.5.2",
+    "jspdf-autotable": "npm:jspdf-autotable@3.8.2"
   }
 }
 

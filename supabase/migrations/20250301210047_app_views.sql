@@ -552,7 +552,7 @@ WITH combined_logs AS (
     SELECT 
         'item' AS log_type,
         oil.id,
-        oil.order_item_id AS order_id, -- Usando order_item_id como order_id para manter consistência
+        o.id AS order_id, -- ID do pedido (orders.id) ao qual o item pertence
         oil.order_item_id,
         oil.changed_by_client,
         oil.changed_by_supplier,
