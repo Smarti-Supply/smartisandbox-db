@@ -26,7 +26,10 @@ export async function processBatch(entries: CancelEntry[]) {
   }
 
   console.log("📦 Batch de cancelamento pronto para envio:", JSON.stringify(batch, null, 2));
-  
+
+  // Evita rate limit Resend (2 req/s): pequeno delay antes do POST
+  await new Promise((r) => setTimeout(r, 1200));
+
   // Envia via Resend
   const batchRes = await fetch("https://api.resend.com/emails/batch", {
     method: "POST",

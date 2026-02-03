@@ -2733,6 +2733,7 @@ DECLARE
     -- variáveis do envio em lotes
     enriched_payload JSONB;
     supplier_contacts_slice TEXT[];
+    v_full_payload JSONB := '[]'::jsonb;
     v_response JSONB;
     -- sessão
     v_uid UUID := (select auth.uid());
@@ -2775,24 +2776,20 @@ BEGIN
     FROM public.companies
     WHERE id = v_company_id;
 
-    -- Loop pelos payloads (múltiplos pedidos)
+    -- Montar um único array com todos os entries (evita múltiplas chamadas → rate limit Resend 429)
     FOREACH supplier_payload IN ARRAY supplier_payloads
     LOOP
-        -- Extrai dados do payload atual
         supplier_id := (supplier_payload ->> 'supplier_id')::BIGINT;
         supplier_name := supplier_payload ->> 'supplier_name';
         template_html := supplier_payload ->> 'template_html';
         order_info := supplier_payload -> 'order_info';
         user_observations := supplier_payload ->> 'user_observations';
 
-        -- Converte JSON array para TEXT[]
         supplier_contacts := ARRAY(
             SELECT jsonb_array_elements_text(supplier_payload -> 'supplier_contacts')
         );
 
-        -- Envia emails em lotes de até 100 contatos por vez
         FOR i IN 1..CEIL(array_length(supplier_contacts, 1) / 100.0)::BIGINT LOOP
-            -- fatia os contatos
             supplier_contacts_slice := supplier_contacts[
                 (i - 1) * 100 + 1 : LEAST(i * 100, array_length(supplier_contacts, 1))
             ];
@@ -2809,43 +2806,47 @@ BEGIN
                 'template_html', template_html
             );
 
-            SELECT net.http_post(
-                url := supabase_url || '/functions/v1/' || endpoint,
-                headers := jsonb_build_object(
-                    'Content-Type', 'application/json',
-                    'Authorization', 'Bearer ' || service_role_key,
-                    'edge-token', edge_token
-                ),
-                body := jsonb_build_array(enriched_payload)
-            ) INTO v_response;
-
-            IF (v_response ->> 'status')::INT >= 400 THEN
-              PERFORM private.fn_log_process_event(
-                p_process_name  := 'send_order_cancel_emails',
-                p_function_name := 'fn_send_order_cancel_emails',
-                p_step          := 'edge_call',
-                p_status        := 'error',
-                p_message       := format('Falha no envio do email de cancelamento para %s (pedido: %s): %s', supplier_name, order_info ->> 'order_number', v_response ->> 'body'),
-                p_user_id       := v_user_id,
-                p_metadata      := jsonb_build_object(
-                                      'contatos', supplier_contacts_slice,
-                                      'status', v_response ->> 'status'
-                                    )
-              );
-              CONTINUE;
-            END IF;
-
-            PERFORM private.fn_log_process_event(
-                p_process_name  := 'send_order_cancel_emails',
-                p_function_name := 'fn_send_order_cancel_emails',
-                p_step          := 'edge_call',
-                p_status        := 'success',
-                p_message       := 'Email de cancelamento enviado para ' || supplier_name || ' - batch de ' || array_length(supplier_contacts_slice, 1) || ' contatos (pedido: ' || (order_info ->> 'order_number') || ')',
-                p_user_id       := v_user_id,
-                p_metadata      := supplier_payload
-            );
+            v_full_payload := v_full_payload || jsonb_build_array(enriched_payload);
         END LOOP;
     END LOOP;
+
+    IF jsonb_array_length(v_full_payload) = 0 THEN
+        RETURN;
+    END IF;
+
+    -- Uma única chamada à Edge (que faz um único POST ao Resend)
+    SELECT net.http_post(
+        url := supabase_url || '/functions/v1/send-order-cancel',
+        headers := jsonb_build_object(
+            'Content-Type', 'application/json',
+            'Authorization', 'Bearer ' || service_role_key,
+            'edge-token', edge_token
+        ),
+        body := v_full_payload
+    ) INTO v_response;
+
+    IF (v_response ->> 'status')::INT >= 400 THEN
+        PERFORM private.fn_log_process_event(
+            p_process_name  := 'send_order_cancel_emails',
+            p_function_name := 'fn_send_order_cancel_emails',
+            p_step          := 'edge_call',
+            p_status        := 'error',
+            p_message       := format('Falha no envio dos emails de cancelamento: %s', v_response ->> 'body'),
+            p_user_id       := v_user_id,
+            p_metadata      := jsonb_build_object('status', v_response ->> 'status', 'entries', jsonb_array_length(v_full_payload))
+        );
+        RETURN;
+    END IF;
+
+    PERFORM private.fn_log_process_event(
+        p_process_name  := 'send_order_cancel_emails',
+        p_function_name := 'fn_send_order_cancel_emails',
+        p_step          := 'edge_call',
+        p_status        := 'success',
+        p_message       := 'Emails de cancelamento enviados em batch: ' || jsonb_array_length(v_full_payload) || ' entries',
+        p_user_id       := v_user_id,
+        p_metadata      := jsonb_build_object('entries', jsonb_array_length(v_full_payload))
+    );
 END;
 $$;
 
@@ -3327,7 +3328,58 @@ BEGIN
 END;
 $$;
 
--- Função para processar fila com retry exponencial e controle de falhas.
+-- ╭────────────────────────────────────────────────────────────────────╮
+-- ┃  Follow-up queue: single Edge call (batch) to avoid Resend 429     ┃
+-- ╰────────────────────────────────────────────────────────────────────╯
+-- Envia todos os itens da fila em uma única chamada à Edge Function,
+-- que por sua vez faz um único POST ao Resend (rate limit: 2 req/s).
+
+-- Função que envia um array de entries para a Edge Function em uma única requisição
+CREATE OR REPLACE FUNCTION private.fn_send_followup_batch_to_edge(payload JSONB)
+RETURNS void
+SECURITY DEFINER
+SET search_path TO 'public', 'vault', 'private'
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  edge_token       TEXT;
+  service_role_key TEXT;
+  supabase_url     TEXT;
+  v_response       JSONB;
+BEGIN
+  IF payload IS NULL OR jsonb_array_length(payload) = 0 THEN
+    RETURN;
+  END IF;
+
+  SELECT decrypted_secret INTO edge_token
+  FROM vault.decrypted_secrets
+  WHERE name = 'INTERNAL_EDGE_TOKEN';
+
+  SELECT decrypted_secret INTO service_role_key
+  FROM vault.decrypted_secrets
+  WHERE name = 'SUPABASE_SERVICE_ROLE_KEY';
+
+  SELECT decrypted_secret INTO supabase_url
+  FROM vault.decrypted_secrets
+  WHERE name = 'SUPABASE_URL';
+
+  SELECT net.http_post(
+    url     := supabase_url || '/functions/v1/send-followup',
+    headers := jsonb_build_object(
+      'Content-Type', 'application/json',
+      'Authorization', 'Bearer ' || service_role_key,
+      'edge-token', edge_token
+    ),
+    body    := payload
+  ) INTO v_response;
+
+  IF (v_response ->> 'status')::INT >= 400 THEN
+    RAISE EXCEPTION 'Edge Function error %: %', v_response ->> 'status', v_response ->> 'body';
+  END IF;
+END;
+$$;
+
+-- Função para processar fila: monta um único payload e chama a Edge uma vez (evita rate limit Resend)
 CREATE OR REPLACE FUNCTION private.fn_process_followup_queue(p_batch_size INT DEFAULT 50)
 RETURNS TABLE (
   processed INT,
@@ -3340,90 +3392,170 @@ SET search_path TO 'public', 'private'
 LANGUAGE plpgsql
 AS $$
 DECLARE
-  q RECORD;
-  v_processed INT := 0;
-  v_success INT := 0;
-  v_failed INT := 0;
-  v_retrying INT := 0;
-  v_next_retry TIMESTAMP;
+  q                RECORD;
+  v_processed      INT := 0;
+  v_success        INT := 0;
+  v_failed         INT := 0;
+  v_retrying       INT := 0;
+  v_next_retry     TIMESTAMP;
+  v_payload        JSONB := '[]'::JSONB;
+  v_queue_ids      BIGINT[] := '{}';
+  v_entry          JSONB;
+  v_supplier_contacts TEXT[];
+  v_orders_payload JSONB;
+  v_company_name   TEXT;
+  v_item           RECORD;
 BEGIN
+  -- Coletar itens elegíveis e montar payload único
   FOR q IN
-      SELECT fq.*, fs.email_template, fs.max_followups
-      FROM private.followup_queue fq
-      JOIN public.followup_settings fs ON fs.id = fq.setting_id
-      WHERE fq.status IN ('pendente', 'falha')
-        AND (fq.next_try_at IS NULL OR fq.next_try_at <= NOW())
-        AND fq.tentativa < COALESCE(fq.max_tentativas, 3)
-      ORDER BY fq.created_at, fq.tentativa
-      LIMIT p_batch_size
+    SELECT fq.id, fq.company_id, fq.supplier_id, fq.order_ids, fq.setting_id, fq.tentativa, fq.max_tentativas,
+           fs.email_template, fs.max_followups
+    FROM private.followup_queue fq
+    JOIN public.followup_settings fs ON fs.id = fq.setting_id
+    WHERE fq.status IN ('pendente', 'falha')
+      AND (fq.next_try_at IS NULL OR fq.next_try_at <= NOW())
+      AND fq.tentativa < COALESCE(fq.max_tentativas, 3)
+    ORDER BY fq.created_at, fq.tentativa
+    LIMIT p_batch_size
   LOOP
-      BEGIN
-          -- Marcar como enviando
-          UPDATE private.followup_queue
-          SET
-              status = 'enviando',
-              last_try_at = NOW(),
-              tentativa = tentativa + 1,
-              updated_at = NOW()
-          WHERE id = q.id;
+    v_processed := v_processed + 1;
 
+    -- Contatos do fornecedor
+    SELECT array_agg(name || ' <' || email || '>') INTO v_supplier_contacts
+    FROM public.supplier_contacts
+    WHERE supplier_id = q.supplier_id
+      AND is_active = TRUE;
 
-          -- Enviar follow-up usando função existente
-          PERFORM private.fn_send_payload_followup_cron(
-              p_company_id := q.company_id,
-              supplier_ids := ARRAY[q.supplier_id],
-              order_ids := q.order_ids,
-              template_html := q.email_template,
-              setting_id := q.setting_id
-          );
+    IF v_supplier_contacts IS NULL OR array_length(v_supplier_contacts, 1) = 0 THEN
+      UPDATE private.followup_queue
+      SET status = 'falha', error_message = 'Sem contatos ativos', updated_at = NOW()
+      WHERE id = q.id;
+      v_failed := v_failed + 1;
+      CONTINUE;
+    END IF;
 
+    -- Payload de pedidos (mesma lógica de fn_send_payload_followup_cron)
+    v_orders_payload := '[]'::JSONB;
+    SELECT COALESCE(
+      jsonb_agg(
+        jsonb_build_object(
+          'order_id', ord.id,
+          'order_number', ord.order_number,
+          'items', ord.items
+        )
+      ),
+      '[]'::JSONB
+    ) INTO v_orders_payload
+    FROM (
+      SELECT
+        o.id,
+        o.order_number,
+        COALESCE(array_agg(oi.item_number) FILTER (WHERE oi.id IS NOT NULL), ARRAY[]::BIGINT[]) AS items
+      FROM public.orders o
+      JOIN public.default_order_status dos ON o.status_id = dos.id
+      LEFT JOIN public.order_items oi ON oi.order_id = o.id
+      WHERE o.company_id = q.company_id
+        AND o.supplier_id = q.supplier_id
+        AND (q.order_ids IS NULL OR o.id = ANY(q.order_ids))
+        AND (
+          NOT EXISTS (
+            SELECT 1 FROM public.order_items oi2
+            JOIN public.order_item_status ois2 ON oi2.status_id = ois2.id
+            WHERE oi2.order_id = o.id AND ois2.is_final = FALSE
+          )
+          OR (
+            EXISTS (
+              SELECT 1 FROM public.order_items oi2
+              JOIN public.order_item_status ois2 ON oi2.status_id = ois2.id
+              WHERE oi2.order_id = o.id AND ois2.is_final = FALSE
+            )
+            AND (
+              (dos.is_final = FALSE AND dos.code != 'concluido')
+              OR (dos.code = 'concluido')
+            )
+          )
+        )
+      GROUP BY o.id, o.order_number
+    ) ord;
 
-          -- Atualizar contadores de follow-up por item
-          PERFORM private.fn_update_followup_counters(q.setting_id, q.order_ids);
+    IF v_orders_payload = '[]'::JSONB OR jsonb_array_length(v_orders_payload) = 0 THEN
+      UPDATE private.followup_queue
+      SET status = 'falha', error_message = 'Nenhum pedido elegível', updated_at = NOW()
+      WHERE id = q.id;
+      v_failed := v_failed + 1;
+      CONTINUE;
+    END IF;
 
+    SELECT name INTO v_company_name
+    FROM public.companies
+    WHERE id = q.company_id;
 
-          -- Marcar como sucesso
-          UPDATE private.followup_queue
-          SET
-              status = 'sucesso',
-              updated_at = NOW(),
-              error_message = NULL
-          WHERE id = q.id;
+    v_entry := jsonb_build_object(
+      'user_id', NULL,
+      'company_id', q.company_id,
+      'company_name', COALESCE(v_company_name, ''),
+      'supplier_id', q.supplier_id,
+      'supplier_contacts', to_jsonb(v_supplier_contacts),
+      'orders_payload', v_orders_payload,
+      'template_html', q.email_template,
+      'setting_id', q.setting_id,
+      'user_observations', ''
+    );
 
-
-          v_success := v_success + 1;
-
-
-      EXCEPTION WHEN OTHERS THEN
-          -- Calcular próxima tentativa (backoff exponencial)
-          v_next_retry := NOW() + (POWER(2, q.tentativa) || ' minutes')::INTERVAL;
-
-
-          -- Verificar se excedeu máximo de tentativas
-          IF q.tentativa >= COALESCE(q.max_tentativas, 3) THEN
-              UPDATE followup_queue
-              SET
-                  status = 'falha',
-                  error_message = SQLERRM,
-                  updated_at = NOW()
-              WHERE id = q.id;
-              v_failed := v_failed + 1;
-          ELSE
-              UPDATE private.followup_queue
-              SET
-                  status = 'falha',
-                  next_try_at = v_next_retry,
-                  error_message = SQLERRM,
-                  updated_at = NOW()
-              WHERE id = q.id;
-              v_retrying := v_retrying + 1;
-          END IF;
-      END;
-
-
-      v_processed := v_processed + 1;
+    v_payload := v_payload || jsonb_build_array(v_entry);
+    v_queue_ids := v_queue_ids || q.id;
   END LOOP;
 
+  -- Nada para enviar
+  IF jsonb_array_length(v_payload) = 0 THEN
+    RETURN QUERY SELECT v_processed, v_success, v_failed, v_retrying;
+    RETURN;
+  END IF;
+
+  -- Marcar todos do batch como enviando e incrementar tentativa
+  UPDATE private.followup_queue
+  SET
+    status     = 'enviando',
+    last_try_at = NOW(),
+    tentativa  = tentativa + 1,
+    updated_at = NOW()
+  WHERE id = ANY(v_queue_ids);
+
+  BEGIN
+    PERFORM private.fn_send_followup_batch_to_edge(v_payload);
+  EXCEPTION WHEN OTHERS THEN
+    v_next_retry := NOW() + INTERVAL '1 minute';
+    FOR v_item IN
+      SELECT id, tentativa, COALESCE(max_tentativas, 3) AS max_tentativas
+      FROM private.followup_queue
+      WHERE id = ANY(v_queue_ids)
+    LOOP
+      IF v_item.tentativa >= v_item.max_tentativas THEN
+        UPDATE private.followup_queue
+        SET status = 'falha', error_message = SQLERRM, updated_at = NOW()
+        WHERE id = v_item.id;
+        v_failed := v_failed + 1;
+      ELSE
+        UPDATE private.followup_queue
+        SET status = 'falha', next_try_at = v_next_retry, error_message = SQLERRM, updated_at = NOW()
+        WHERE id = v_item.id;
+        v_retrying := v_retrying + 1;
+      END IF;
+    END LOOP;
+    RETURN QUERY SELECT v_processed, v_success, v_failed, v_retrying;
+    RETURN;
+  END;
+
+  -- Sucesso: marcar todos como sucesso e atualizar contadores
+  UPDATE private.followup_queue
+  SET status = 'sucesso', updated_at = NOW(), error_message = NULL
+  WHERE id = ANY(v_queue_ids);
+
+  FOR v_item IN SELECT setting_id, order_ids FROM private.followup_queue WHERE id = ANY(v_queue_ids) LOOP
+    PERFORM private.fn_update_followup_counters(v_item.setting_id, v_item.order_ids);
+  END LOOP;
+
+  v_success := array_length(v_queue_ids, 1);
   RETURN QUERY SELECT v_processed, v_success, v_failed, v_retrying;
 END;
 $$;

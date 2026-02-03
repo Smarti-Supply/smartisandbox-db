@@ -72,6 +72,9 @@ export async function sendEmail(
     attachments: [{ filename: pdfFilename, content: pdfBase64 }],
   };
 
+  // Evita rate limit Resend (2 req/s) quando há múltiplas requisições em sequência
+  await new Promise((r) => setTimeout(r, 500));
+
   const res = await fetch("https://api.resend.com/emails", {
     method: "POST",
     headers: {
