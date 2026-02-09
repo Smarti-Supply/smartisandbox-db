@@ -9,10 +9,9 @@
 -- ┃                 Tabelas customizadas                       ┃
 -- ╰────────────────────────────────────────────────────────────╯
 
--- Adiciona os campos na tabela company_users
-ALTER TABLE public.company_users
-ADD COLUMN supplier_letter TEXT NULL,
-ADD COLUMN supplier_id BIGINT NULL;
+-- Adiciona os campos na tabela company_users (supplier_letter pode já existir via migration base)
+ALTER TABLE public.company_users ADD COLUMN IF NOT EXISTS supplier_letter TEXT NULL;
+ALTER TABLE public.company_users ADD COLUMN IF NOT EXISTS supplier_id BIGINT NULL;
 
 -- Adiciona comentários descritivos nas colunas
 COMMENT ON COLUMN public.company_users.supplier_letter IS

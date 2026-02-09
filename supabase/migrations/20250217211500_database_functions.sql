@@ -2071,6 +2071,9 @@ END;
 $$;
 
 
+-- Coluna opcional para filtrar follow-up por responsável (ex.: Transpetro: supplier_letter)
+ALTER TABLE public.company_users ADD COLUMN IF NOT EXISTS supplier_letter TEXT NULL;
+
 -- Função para criar payload para enviar e-mails de follow-up
 CREATE OR REPLACE FUNCTION public.fn_send_payload_followup(
   supplier_ids BIGINT[] DEFAULT NULL,
@@ -2094,6 +2097,7 @@ DECLARE
   html_template_final TEXT;
   v_company_id BIGINT;
   v_uid UUID := (select auth.uid());
+  v_supplier_letter TEXT;
   entry JSONB;
   order_entry JSONB;
   order_id_val BIGINT;
@@ -2128,6 +2132,11 @@ BEGIN
   ELSE
     html_template_final := template_html;
   END IF;
+
+  -- Captura supplier_letter do usuário (filtrar por responsável; ex. Transpetro)
+  SELECT cu.supplier_letter INTO v_supplier_letter
+  FROM public.company_users cu
+  WHERE cu.id = v_uid;
 
   -- Define os suppliers a processar
   IF order_ids IS NOT NULL AND array_length(order_ids, 1) IS NOT NULL THEN
@@ -2170,22 +2179,50 @@ BEGIN
       );
 
   ELSE
-    SELECT array_agg(DISTINCT supplier_id) INTO suppliers_to_process
-    FROM public.orders o
-    JOIN public.default_order_status dos ON o.status_id = dos.id
-    WHERE o.company_id = v_company_id
-      AND (
-        -- Se tem itens não finais, verifica o status do pedido
-        EXISTS (
-          SELECT 1 FROM public.order_items oi
-          JOIN public.order_item_status ois ON oi.status_id = ois.id
-          WHERE oi.order_id = o.id AND ois.is_final = FALSE
+    IF v_supplier_letter IS NULL THEN
+      -- Comportamento padrão: todos os fornecedores elegíveis da company
+      SELECT array_agg(DISTINCT supplier_id) INTO suppliers_to_process
+      FROM public.orders o
+      JOIN public.default_order_status dos ON o.status_id = dos.id
+      WHERE o.company_id = v_company_id
+        AND (
+          -- Se tem itens não finais, verifica o status do pedido
+          EXISTS (
+            SELECT 1 FROM public.order_items oi
+            JOIN public.order_item_status ois ON oi.status_id = ois.id
+            WHERE oi.order_id = o.id AND ois.is_final = FALSE
+          )
+          AND (
+            (dos.is_final = FALSE AND dos.code != 'concluido')
+            OR (dos.code = 'concluido')
+          )
+        );
+    ELSE
+      -- Filtro por responsável: apenas fornecedores cuja primeira letra do nome está em supplier_letter
+      SELECT array_agg(DISTINCT o.supplier_id) INTO suppliers_to_process
+      FROM public.orders o
+      JOIN public.default_order_status dos ON o.status_id = dos.id
+      JOIN public.suppliers s ON s.id = o.supplier_id
+      WHERE o.company_id = v_company_id
+        AND (
+          LOWER(LEFT(s.name, 1)) = ANY(SELECT LOWER(UNNEST(string_to_array(v_supplier_letter, ';'))))
+          OR (
+            '#' = ANY(string_to_array(v_supplier_letter, ';'))
+            AND LEFT(s.name, 1) ~ '^[0-9]'
+          )
         )
         AND (
-          (dos.is_final = FALSE AND dos.code != 'concluido')
-          OR (dos.code = 'concluido')
-        )
-      );
+          EXISTS (
+            SELECT 1 FROM public.order_items oi
+            JOIN public.order_item_status ois ON oi.status_id = ois.id
+            WHERE oi.order_id = o.id AND ois.is_final = FALSE
+          )
+          AND (
+            (dos.is_final = FALSE AND dos.code != 'concluido')
+            OR (dos.code = 'concluido')
+          )
+        );
+    END IF;
   END IF;
 
   -- Loop de fornecedores
