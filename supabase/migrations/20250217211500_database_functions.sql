@@ -2986,7 +2986,8 @@ BEGIN
   END IF;
 
 
-  v_days_before := COALESCE(v_days_before, 3);
+  -- Usar ABS() para suportar valores negativos (ex: -3 = 3 dias antes)
+  v_days_before := ABS(COALESCE(v_days_before, 3));
   v_max_followups := COALESCE(v_max_followups, 999);
 
 
@@ -3119,7 +3120,8 @@ BEGIN
   END IF;
 
 
-  v_days_before := COALESCE(v_days_before, 3);
+  -- Usar ABS() para suportar valores negativos (ex: -14 = 14 dias antes)
+  v_days_before := ABS(COALESCE(v_days_before, 3));
   v_max_followups := COALESCE(v_max_followups, 999);
 
 
@@ -3185,7 +3187,8 @@ BEGIN
   END IF;
 
 
-  v_days_before := COALESCE(v_days_before, 3);
+  -- Usar ABS() para suportar valores negativos
+  v_days_before := ABS(COALESCE(v_days_before, 3));
   v_max_followups := COALESCE(v_max_followups, 999);
 
 
@@ -3252,7 +3255,11 @@ BEGIN
   LOOP
       
       -- Verificar se passou o intervalo mínimo desde o último envio
-      IF setting.last_sent_at IS NOT NULL 
+      -- IMPORTANTE: NÃO aplicar para trigger_scopes baseados em datas,
+      -- pois send_days_interval define a janela de datas, não a frequência.
+      -- Para esses casos, a frequência é controlada por repeat_interval_days na fn_queue_followup.
+      IF setting.trigger_scope NOT IN ('order_due_date', 'item_due_date', 'item_delivery_date')
+         AND setting.last_sent_at IS NOT NULL 
          AND setting.send_days_interval IS NOT NULL 
          AND setting.send_days_interval > 0
          AND setting.last_sent_at > (NOW() - (setting.send_days_interval || ' days')::INTERVAL) THEN
