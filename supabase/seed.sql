@@ -55,16 +55,16 @@ VALUES
 -- Seed de configurações de follow-up para a Empresa 1 (com IDs explícitos)
 INSERT INTO public.followup_settings (
     id, company_id, rule_name, trigger_scope, trigger_reference_id, send_days_interval,
-    repeat_interval_days, max_followups, email_template, notification_type, is_active, created_at, is_system_config
+    repeat_interval_days, max_followups, cooldown_per_order, email_template, notification_type, is_active, created_at, is_system_config
 )
 VALUES
-    (1, 1, 'Pedido aguardando confirmação', 'item_status', 1, 0, 2, 3, 'template_aguardando_confirmacao', 'email', TRUE, now(), FALSE),
-    (2, 1, 'Item aguardando entrega', 'item_status', 2, 3, 3, 2, 'template_aguardando_entrega', 'email', TRUE, now(), FALSE),
-    (3, 1, 'Entrega em atraso', 'item_delivery_date', NULL, 0, 2, 5, 'template_entrega_atrasada', 'email', TRUE, now(), FALSE),
-    (4, 1, 'Aguardando MIGO', 'item_status', 4, 1, 2, 2, 'template_migo_pendente', 'email', TRUE, now(), FALSE),
-    (5, 1, 'Pedido com vencimento próximo', 'order_due_date', NULL, -3, NULL, 1, 'template_vencimento_proximo', 'email', TRUE, now(), FALSE),
-    (6, 1, 'Manual Followup', 'manual_user_trigger', null, null, null, null, null, 'email', TRUE, now(), TRUE),
-    (7, 1, 'Manual Cancelamento de Pedido', 'manual_user_order_cancel', null, null, null, null, null, 'email', TRUE, now(), TRUE);
+    (1, 1, 'Pedido aguardando confirmação', 'item_status', 1, 0, 2, 3, TRUE, 'template_aguardando_confirmacao', 'email', TRUE, now(), FALSE),
+    (2, 1, 'Item aguardando entrega', 'item_status', 2, 3, 3, 2, FALSE, 'template_aguardando_entrega', 'email', TRUE, now(), FALSE),
+    (3, 1, 'Entrega em atraso', 'item_delivery_date', NULL, 0, 2, 5, FALSE, 'template_entrega_atrasada', 'email', TRUE, now(), FALSE),
+    (4, 1, 'Aguardando MIGO', 'item_status', 4, 1, 2, 2, FALSE, 'template_migo_pendente', 'email', TRUE, now(), FALSE),
+    (5, 1, 'Pedido com vencimento próximo', 'order_due_date', NULL, -3, NULL, 1, FALSE, 'template_vencimento_proximo', 'email', TRUE, now(), FALSE),
+    (6, 1, 'Manual Followup', 'manual_user_trigger', null, null, null, null, FALSE, null, 'email', TRUE, now(), TRUE),
+    (7, 1, 'Manual Cancelamento de Pedido', 'manual_user_order_cancel', null, null, null, null, FALSE, null, 'email', TRUE, now(), TRUE);
 
 
 -- Tabela public.import_field_mappings (Criando mapeamentos de campos para importação de pedidos)

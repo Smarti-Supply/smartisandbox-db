@@ -3328,21 +3328,32 @@ AS $$
 DECLARE
     v_company_id BIGINT;
     v_repeat_interval_days INT;
+    v_cooldown_per_order BOOLEAN;
     v_last_success_at TIMESTAMP;
     v_should_queue BOOLEAN := FALSE;
 BEGIN
-    -- Buscar company_id e repeat_interval_days do setting
-    SELECT fs.company_id, fs.repeat_interval_days
-    INTO v_company_id, v_repeat_interval_days
+    -- Buscar company_id, repeat_interval_days e cooldown_per_order do setting
+    SELECT fs.company_id, fs.repeat_interval_days, fs.cooldown_per_order
+    INTO v_company_id, v_repeat_interval_days, v_cooldown_per_order
     FROM public.followup_settings fs
     WHERE fs.id = p_setting_id;
 
-    -- Buscar último envio bem-sucedido para este supplier+setting
-    SELECT MAX(updated_at) INTO v_last_success_at
-    FROM private.followup_queue
-    WHERE setting_id = p_setting_id
-      AND supplier_id = p_supplier_id
-      AND status = 'sucesso';
+    -- Buscar último envio bem-sucedido: por pedidos ou por fornecedor conforme a flag
+    IF v_cooldown_per_order THEN
+        -- Cooldown por pedido: verificar se estes pedidos específicos já receberam
+        SELECT MAX(updated_at) INTO v_last_success_at
+        FROM private.followup_queue
+        WHERE setting_id = p_setting_id
+          AND order_ids && p_order_ids
+          AND status = 'sucesso';
+    ELSE
+        -- Cooldown por fornecedor (comportamento atual)
+        SELECT MAX(updated_at) INTO v_last_success_at
+        FROM private.followup_queue
+        WHERE setting_id = p_setting_id
+          AND supplier_id = p_supplier_id
+          AND status = 'sucesso';
+    END IF;
 
     -- Decidir se deve enfileirar baseado no repeat_interval_days
     IF v_repeat_interval_days IS NULL OR v_repeat_interval_days = 0 THEN
@@ -3358,15 +3369,16 @@ BEGIN
         END IF;
     END IF;
 
-    -- Se deve enfileirar E não existe item pendente/enviando, inserir
+    -- Se deve enfileirar E não existe item pendente/enviando para estes pedidos, inserir
     IF v_should_queue THEN
         INSERT INTO private.followup_queue (setting_id, supplier_id, company_id, order_ids, next_try_at)
         SELECT p_setting_id, p_supplier_id, v_company_id, p_order_ids, NOW()
         WHERE NOT EXISTS (
-            SELECT 1 FROM private.followup_queue
-            WHERE setting_id = p_setting_id
-              AND supplier_id = p_supplier_id
-              AND status IN ('pendente', 'enviando')
+            SELECT 1 FROM private.followup_queue q
+            WHERE q.setting_id = p_setting_id
+              AND q.supplier_id = p_supplier_id
+              AND q.status IN ('pendente', 'enviando')
+              AND (NOT v_cooldown_per_order OR q.order_ids && p_order_ids)
         );
     END IF;
 END;

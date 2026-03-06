@@ -425,6 +425,7 @@ CREATE TABLE public.followup_settings (
     send_days_interval INT NULL,
     repeat_interval_days INT NULL,
     max_followups INT NULL,
+    cooldown_per_order BOOLEAN NOT NULL DEFAULT FALSE,
 
     -- Configurações de notificação
     email_template TEXT NULL,

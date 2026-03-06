@@ -430,6 +430,7 @@ SELECT
     fs.send_days_interval,
     fs.repeat_interval_days,
     fs.max_followups,
+    fs.cooldown_per_order,
     fs.email_template,
     fs.notification_type,
     fs.is_active,
