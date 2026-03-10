@@ -4074,6 +4074,7 @@ DECLARE
   followup_tracking_data JSONB;
   followup_logs_data JSONB;
   order_item_invoices_data JSONB;
+  order_change_logs_data JSONB;
   combined_data JSONB;
   payload JSONB;
   export_id UUID;
@@ -4270,6 +4271,24 @@ BEGIN
   LEFT JOIN public.supplier_contacts sc ON sc.id = su.supplier_contact_id
   WHERE oi.order_id = p_order_id;
 
+  -- Buscar logs de alteração (view) para unificar data no relatório
+  SELECT COALESCE(jsonb_agg(
+    jsonb_build_object(
+      'created_at', created_at,
+      'formatted_created_at', formatted_created_at,
+      'change_type_label', change_type_label,
+      'change_description', change_description,
+      'item_number', item_number,
+      'changed_by_name', changed_by_name,
+      'changed_by_email', changed_by_email,
+      'log_type', log_type
+    )
+    ORDER BY created_at ASC
+  ), '[]'::jsonb)
+  INTO order_change_logs_data
+  FROM public.view_order_change_logs
+  WHERE order_id = p_order_id;
+
   -- Combinar os dados
   combined_data := jsonb_build_object(
     'id_pedido', p_order_id,
@@ -4303,6 +4322,7 @@ BEGIN
     'followup_tracking', followup_tracking_data,
     'followup_logs', COALESCE(followup_logs_data, '[]'::jsonb),
     'order_item_invoices', COALESCE(order_item_invoices_data, '[]'::jsonb),
+    'order_change_logs', COALESCE(order_change_logs_data, '[]'::jsonb),
     'user_id', p_user_id,
     'company_id', v_company_id,
     'user_email', user_email

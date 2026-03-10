@@ -46,6 +46,8 @@ Deno.serve(async (req) => {
     const followupLogs = (p.followup_logs as Record<string, unknown>[]) ?? [];
     const orderItemInvoices =
       (p.order_item_invoices as Record<string, unknown>[]) ?? [];
+    const orderChangeLogs =
+      (p.order_change_logs as Record<string, unknown>[]) ?? [];
     const userEmail = p.user_email as string;
     const orderNumber = order?.numero_pedido as string | undefined;
 
@@ -69,7 +71,8 @@ Deno.serve(async (req) => {
       observations,
       followupTracking,
       followupLogs,
-      orderItemInvoices
+      orderItemInvoices,
+      orderChangeLogs
     );
     console.log(`⏱ PDF gerado — ${pdfBytes.length} bytes`);
 

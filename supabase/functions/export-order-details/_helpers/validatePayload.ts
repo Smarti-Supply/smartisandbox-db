@@ -41,6 +41,11 @@ export function validatePayload(payload: unknown): OrderDetailsPayload {
     throw new Error('order_item_invoices é obrigatório e deve ser um array');
   }
 
+  // order_change_logs: opcional, default [] (para compatibilidade e deploy gradual)
+  const order_change_logs = Array.isArray(p.order_change_logs)
+    ? (p.order_change_logs as Record<string, unknown>[])
+    : [];
+
   if (!p.user_id || typeof p.user_id !== 'string') {
     throw new Error('user_id é obrigatório e deve ser uma string');
   }
@@ -68,6 +73,7 @@ export function validatePayload(payload: unknown): OrderDetailsPayload {
     followup_tracking: p.followup_tracking as Record<string, unknown>[],
     followup_logs: p.followup_logs as Record<string, unknown>[],
     order_item_invoices: p.order_item_invoices as Record<string, unknown>[],
+    order_change_logs,
     user_id: p.user_id,
     company_id: p.company_id,
     user_email: p.user_email

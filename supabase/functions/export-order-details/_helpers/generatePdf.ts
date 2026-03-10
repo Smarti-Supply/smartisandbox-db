@@ -4,8 +4,8 @@ import autoTableModule from "npm:jspdf-autotable@3.8.2";
 type AutoTableFn = (doc: unknown, opts: unknown) => void;
 const autoTable: AutoTableFn =
   typeof (autoTableModule as { default?: unknown }).default === "function"
-    ? (autoTableModule as { default: AutoTableFn }).default
-    : (autoTableModule as AutoTableFn);
+    ? ((autoTableModule as { default?: unknown }).default as unknown as AutoTableFn)
+    : (autoTableModule as unknown as AutoTableFn);
 
 type RecordStr = Record<string, unknown>;
 
@@ -60,15 +60,18 @@ interface TimelineEvent {
   date: string | null;
   description: string;
   user: string;
+  /** Data formatada para exibição (ex.: da view); quando definido, usado na coluna Data do PDF. */
+  displayDate?: string;
 }
 
 function createTimelineEvents(
   order: RecordStr,
   _orderItems: RecordStr[],
   observations: RecordStr[],
-  followupTracking: RecordStr[],
+  _followupTracking: RecordStr[],
   followupLogs: RecordStr[],
-  orderItemInvoices: RecordStr[]
+  orderItemInvoices: RecordStr[],
+  orderChangeLogs: RecordStr[] = []
 ): TimelineEvent[] {
   const events: TimelineEvent[] = [];
   const pedidoCriadoEm =
@@ -107,22 +110,32 @@ function createTimelineEvents(
     }
   }
 
-  for (const followup of followupTracking) {
-    const itemId = followup.numero_item as number | undefined;
-    const itemDesc = itemId != null ? `Item ${itemId}` : "Pedido";
-    const criadoEm = followup.criado_em as string;
-    const regra = followup.regras_de_followup as string;
-    const userFormatted = formatUser(
-      followup.usuario_nome as string,
-      followup.usuario_email as string
-    );
-    if (regra) {
-      events.push({
-        date: criadoEm ?? null,
-        description: `Status do ${itemDesc} alterado para "${regra}"`,
-        user: userFormatted,
-      });
+  for (const log of orderChangeLogs) {
+    const createdAt = log.created_at as string | undefined;
+    const formattedCreatedAt = log.formatted_created_at as string | undefined;
+    const changeDescription = log.change_description as string | undefined;
+    if (!changeDescription) continue;
+    // Não exibir alterações genéricas sem detalhe
+    if (
+      changeDescription === "Alteração realizada" ||
+      changeDescription === "Alteração realizada no item"
+    ) {
+      continue;
     }
+    // Não exibir mudanças de "nada" para algo (ex.: de "N/A" para "X")
+    if (/de\s+"N\/A"\s+para\s+"/i.test(changeDescription)) {
+      continue;
+    }
+    const userFormatted = formatUser(
+      log.changed_by_name as string,
+      log.changed_by_email as string
+    );
+    events.push({
+      date: createdAt ?? null,
+      description: changeDescription,
+      user: userFormatted,
+      displayDate: formattedCreatedAt ?? undefined,
+    });
   }
 
   for (const log of followupLogs) {
@@ -205,7 +218,8 @@ export function generatePdf(
   observations: RecordStr[],
   followupTracking: RecordStr[],
   followupLogs: RecordStr[],
-  orderItemInvoices: RecordStr[]
+  orderItemInvoices: RecordStr[],
+  orderChangeLogs: RecordStr[] = []
 ): Uint8Array {
   const doc = new jsPDF({
     orientation: "portrait",
@@ -250,12 +264,13 @@ export function generatePdf(
     observations,
     followupTracking,
     followupLogs,
-    orderItemInvoices
+    orderItemInvoices,
+    orderChangeLogs
   );
 
   const tableData = events.length
     ? events.map((e) => [
-        e.date ? formatDateTime(e.date) : "-",
+        e.displayDate ?? (e.date ? formatDateTime(e.date) : "-"),
         e.description,
         e.user,
       ])

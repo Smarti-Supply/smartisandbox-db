@@ -7,6 +7,7 @@ export interface OrderDetailsPayload {
   followup_tracking: Record<string, unknown>[];
   followup_logs: Record<string, unknown>[];
   order_item_invoices: Record<string, unknown>[];
+  order_change_logs: Record<string, unknown>[];
   user_id: string;
   company_id: number;
   user_email: string;
