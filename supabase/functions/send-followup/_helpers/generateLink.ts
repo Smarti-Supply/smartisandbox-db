@@ -1,4 +1,5 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
+import { RESEND_FOLLOWUP_FROM } from "../../_shared/resendFollowupFrom.ts";
 import { buildHtmlBlocks } from "../_helpers/buildHtmlBlocks.ts";
 import { renderHtml } from "../_helpers/renderHtml.ts";
 import type { Entry } from "../_helpers/types.ts";
@@ -51,7 +52,7 @@ export async function generateLink(entry: Entry, contact: string) {
   const plainText = renderPlainText(entry.template_html, blocks);
 
   return {
-    from: "SmartiSupply Followup <followup@smartisupply.com.br>",
+    from: RESEND_FOLLOWUP_FROM,
     to: [email],
     subject: entry.company_name
       ? `${entry.company_name} - Follow-up de pedidos`

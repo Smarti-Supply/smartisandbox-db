@@ -50,22 +50,23 @@ SELECT cron.schedule(
 -- ╰────────────────────────────────────────────────────────────────────╯
 
 -- Cron para identificar e enfileirar follow-ups agendados a cada minuto
+-- (wrapper dispara notify-ops em caso de exceção não tratada)
 SELECT cron.schedule(
   'execute-scheduled-followups',
   '* * * * *',  -- Todo início de hora (UTC)
-  'SELECT private.fn_execute_scheduled_followups();'
+  'SELECT * FROM private.fn_execute_scheduled_followups_with_alert();'
 );
 
 -- Cron para processar a fila de follow-ups a cada 5 minutos
 SELECT cron.schedule(
   'process-followup-queue',
   '*/5 * * * *',  -- A cada 5 minutos
-  'SELECT private.fn_process_followup_queue(50);'
+  'SELECT * FROM private.fn_process_followup_queue_with_alert(50);'
 );
 
 -- Cron para limpar a fila de follow-ups diariamente às 02:00 UTC
 SELECT cron.schedule(
   'cleanup-followup-queue',
   '0 5 * * *',  -- todos os dias às 5:00 da manhã (GMT)
-  'SELECT private.fn_cleanup_followup_queue();'
+  'SELECT * FROM private.fn_cleanup_followup_queue_with_alert();'
 );
