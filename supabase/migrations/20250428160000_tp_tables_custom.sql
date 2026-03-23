@@ -228,8 +228,7 @@ WHERE
       FROM public.company_users cu2
       WHERE cu2.supplier_id IS NOT NULL
     )
-  )
-LIMIT 1000;
+  );
 
 -- View encapsulada para filtrar os fornecedores por inicial
 CREATE OR REPLACE VIEW public.view_suppliers_filtered_by_user
@@ -289,8 +288,7 @@ WHERE
             FROM public.company_users cu2
             WHERE cu2.supplier_id IS NOT NULL
         )
-    )
-LIMIT 1000;
+    );
 
 -- Criar view para listar os usuários do sistema
 CREATE OR REPLACE VIEW public.view_company_users_with_supplier_letter

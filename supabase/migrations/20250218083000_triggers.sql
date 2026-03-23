@@ -300,7 +300,10 @@ DECLARE
   v_user_id UUID := (select auth.uid());
 BEGIN
   -- Define 'client' como padrão caso request.source não tenha sido definido
-  request_source := COALESCE(current_setting('request.source', true), 'client');
+  request_source := COALESCE(NULLIF(LOWER(BTRIM(current_setting('request.source', true))), ''), 'client');
+  IF request_source NOT IN ('client', 'supplier') THEN
+    request_source := 'client';
+  END IF;
 
   -- Se for uma requisição do fornecedor, tenta buscar o ID
   BEGIN
@@ -378,7 +381,10 @@ DECLARE
   v_user_id UUID := (select auth.uid());
 BEGIN
   -- Define 'client' como padrão caso request.source não tenha sido definido
-  request_source := COALESCE(current_setting('request.source', true), 'client');
+  request_source := COALESCE(NULLIF(LOWER(BTRIM(current_setting('request.source', true))), ''), 'client');
+  IF request_source NOT IN ('client', 'supplier') THEN
+    request_source := 'client';
+  END IF;
 
   -- Captura o usuário do fornecedor, se aplicável
   BEGIN
@@ -1102,7 +1108,10 @@ DECLARE
   is_supplier BOOLEAN := FALSE;
 BEGIN
   -- Define 'client' como padrão caso request.source não tenha sido definido
-  request_source := COALESCE(current_setting('request.source', true), 'client');
+  request_source := COALESCE(NULLIF(LOWER(BTRIM(current_setting('request.source', true))), ''), 'client');
+  IF request_source NOT IN ('client', 'supplier') THEN
+    request_source := 'client';
+  END IF;
 
   -- Se for uma requisição do fornecedor, tenta buscar o ID
   BEGIN
@@ -1262,7 +1271,7 @@ DECLARE
   v_request_source TEXT;
 BEGIN
   BEGIN
-    v_request_source := current_setting('request.source', true);
+    v_request_source := NULLIF(LOWER(BTRIM(current_setting('request.source', true))), '');
   EXCEPTION WHEN OTHERS THEN
     v_request_source := NULL;
   END;
@@ -1312,7 +1321,7 @@ DECLARE
   v_request_source TEXT;
 BEGIN
   BEGIN
-    v_request_source := current_setting('request.source', true);
+    v_request_source := NULLIF(LOWER(BTRIM(current_setting('request.source', true))), '');
   EXCEPTION WHEN OTHERS THEN
     v_request_source := NULL;
   END;
@@ -1362,7 +1371,7 @@ DECLARE
   v_request_source TEXT;
 BEGIN
   BEGIN
-    v_request_source := current_setting('request.source', true);
+    v_request_source := NULLIF(LOWER(BTRIM(current_setting('request.source', true))), '');
   EXCEPTION WHEN OTHERS THEN
     v_request_source := NULL;
   END;
@@ -1417,7 +1426,7 @@ DECLARE
   v_request_source TEXT;
 BEGIN
   BEGIN
-    v_request_source := current_setting('request.source', true);
+    v_request_source := NULLIF(LOWER(BTRIM(current_setting('request.source', true))), '');
   EXCEPTION WHEN OTHERS THEN
     v_request_source := NULL;
   END;
@@ -1466,7 +1475,7 @@ DECLARE
     v_supplier_name TEXT;
 BEGIN
     BEGIN
-        v_request_source := current_setting('request.source', true);
+        v_request_source := NULLIF(LOWER(BTRIM(current_setting('request.source', true))), '');
         v_supplier_contact_id := current_setting('request.supplier_contact_id', true);
         v_user_id := current_setting('request.user_id', true);
     EXCEPTION WHEN OTHERS THEN
@@ -1526,7 +1535,7 @@ DECLARE
     v_company_name TEXT;
 BEGIN
     BEGIN
-        v_request_source := current_setting('request.source', true);
+        v_request_source := NULLIF(LOWER(BTRIM(current_setting('request.source', true))), '');
         v_user_id := current_setting('request.user_id', true);
     EXCEPTION WHEN OTHERS THEN
         v_request_source := NULL;
@@ -1594,7 +1603,7 @@ DECLARE
   v_company_name TEXT;
 BEGIN
   BEGIN
-    v_request_source := current_setting('request.source', true);
+    v_request_source := NULLIF(LOWER(BTRIM(current_setting('request.source', true))), '');
   EXCEPTION WHEN OTHERS THEN
     v_request_source := NULL;
   END;
@@ -1655,7 +1664,7 @@ DECLARE
   v_changes TEXT[] := '{}';
 BEGIN
   BEGIN
-    v_request_source := current_setting('request.source', true);
+    v_request_source := NULLIF(LOWER(BTRIM(current_setting('request.source', true))), '');
   EXCEPTION WHEN OTHERS THEN
     v_request_source := NULL;
   END;

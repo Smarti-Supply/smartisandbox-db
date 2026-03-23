@@ -465,6 +465,7 @@ BEGIN
     RAISE EXCEPTION 'Acesso não autorizado à função fn_insert_orders.';
   END IF;
 
+  PERFORM set_config('request.source', 'client', true);
   PERFORM set_config('request.user_id', owner_id::TEXT, true);
 
   -- Obter total de registros
@@ -593,6 +594,7 @@ BEGIN
     RAISE EXCEPTION 'Acesso não autorizado.';
   END IF;
 
+  PERFORM set_config('request.source', 'client', true);
   PERFORM set_config('request.user_id', owner_id::TEXT, true);
 
   -- Obter total de registros
