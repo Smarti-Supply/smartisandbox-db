@@ -1,17 +1,31 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 import { getCorsHeaders } from "../_shared/cors.ts";
+import {
+  isEmailSendRateLimited,
+  isWithinMagicLinkCooldown,
+  MAGIC_LINK_COOLDOWN_MS,
+} from "../_shared/magic_link_cooldown.ts";
 
-// Variáveis de ambiente
 const FOLLOWUP_URL = Deno.env.get("FOLLOWUP_URL")!;
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 
-// Instância do Supabase com SERVICE_ROLE
 const supabase = createClient(SUPABASE_URL, SERVICE_ROLE_KEY, {
   auth: { autoRefreshToken: false, persistSession: false },
 });
 
-Deno.serve(async (req: Request): Promise<Response> => {  
+function jsonResponse(
+  body: Record<string, unknown>,
+  status: number,
+  corsHeaders: HeadersInit,
+): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { ...corsHeaders, "Content-Type": "application/json" },
+  });
+}
+
+Deno.serve(async (req: Request): Promise<Response> => {
   const origin = req.headers.get("origin");
   const corsHeaders = getCorsHeaders(origin);
 
@@ -24,14 +38,13 @@ Deno.serve(async (req: Request): Promise<Response> => {
     const { user_email } = body;
 
     if (!user_email) {
-      return new Response(
-        JSON.stringify({ error: "Campo obrigatório ausente." }),
-        { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      return jsonResponse(
+        { error: "Campo obrigatório ausente." },
+        400,
+        corsHeaders,
       );
     }
 
-    // Verifica se o fornecedor existe
-    // Primeiro, busca o contato pelo e-mail
     const { data: contact, error: contactError } = await supabase
       .schema("public")
       .from("supplier_contacts")
@@ -40,31 +53,32 @@ Deno.serve(async (req: Request): Promise<Response> => {
       .single();
 
     if (contactError || !contact) {
-        // Não envia erro detalhado para evitar enumeração de e-mails
-        return new Response(JSON.stringify({ success: true }), {
-          status: 200,
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
-        });
-      }
+      return jsonResponse({ success: true }, 200, corsHeaders);
+    }
 
-    // Depois, busca o usuário associado ao contato
     const { data: supplierUser, error: supplierUserError } = await supabase
       .schema("public")
       .from("supplier_users")
-      .select("id, role_id, last_login")
+      .select("id, role_id, last_login, last_magic_link_requested_at")
       .eq("supplier_contact_id", contact.id)
       .single();
 
     if (supplierUserError || !supplierUser) {
-      // Não envia erro detalhado para evitar enumeração de e-mails
-      return new Response(JSON.stringify({ success: true }), {
-        status: 200,
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
+      return jsonResponse({ success: true }, 200, corsHeaders);
     }
 
-    // Gera magic link
-    const { data: _linkSuccess, error: linkError } = await supabase.auth.signInWithOtp({
+    const nowMs = Date.now();
+    if (
+      isWithinMagicLinkCooldown(
+        supplierUser.last_magic_link_requested_at as string | null,
+        MAGIC_LINK_COOLDOWN_MS,
+        nowMs,
+      )
+    ) {
+      return jsonResponse({ success: true }, 200, corsHeaders);
+    }
+
+    const { error: linkError } = await supabase.auth.signInWithOtp({
       email: user_email,
       options: {
         emailRedirectTo: FOLLOWUP_URL,
@@ -73,23 +87,33 @@ Deno.serve(async (req: Request): Promise<Response> => {
     });
 
     if (linkError) {
-      console.error(`Erro ao gerar magic link para ${user_email}:`, linkError);
-      return new Response(JSON.stringify({ success: true }), {
-        status: 200,
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
+      if (isEmailSendRateLimited(linkError)) {
+        console.warn(
+          `Magic link rate limited for ${user_email}:`,
+          linkError.message,
+        );
+      } else {
+        console.error(`Failed to send magic link for ${user_email}:`, linkError);
+      }
+      return jsonResponse({ success: true }, 200, corsHeaders);
     }
 
-    return new Response(JSON.stringify({ success: true }), {
-      status: 200,
-      headers: { ...corsHeaders, "Content-Type": "application/json" },
-    });
+    const { error: updateError } = await supabase
+      .schema("public")
+      .from("supplier_users")
+      .update({ last_magic_link_requested_at: new Date().toISOString() })
+      .eq("id", supplierUser.id);
 
+    if (updateError) {
+      console.error(
+        "Failed to persist last_magic_link_requested_at:",
+        updateError,
+      );
+    }
+
+    return jsonResponse({ success: true }, 200, corsHeaders);
   } catch (err) {
-   console.error("Erro inesperado:", err);
-    return new Response(JSON.stringify({ success: true }), {
-      status: 200,
-      headers: { ...corsHeaders, "Content-Type": "application/json" },
-    });
+    console.error("Unexpected error in supplier-logon:", err);
+    return jsonResponse({ success: true }, 200, corsHeaders);
   }
 });

@@ -191,6 +191,7 @@ CREATE TABLE public.supplier_users (
     supplier_contact_id BIGINT NOT NULL,
     role_id INT NOT NULL,
     last_login TIMESTAMP NULL,
+    last_magic_link_requested_at TIMESTAMPTZ NULL,  -- cooldown magic link (OTP) / limites Auth
     FOREIGN KEY (supplier_contact_id) REFERENCES public.supplier_contacts(id) ON DELETE CASCADE,
     FOREIGN KEY (role_id) REFERENCES public.user_roles(id) ON DELETE RESTRICT
 );
