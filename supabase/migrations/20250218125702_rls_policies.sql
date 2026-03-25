@@ -1221,6 +1221,72 @@ USING (
   AND order_item_invoices.created_by = (select auth.uid())
 );
 
+-- UPDATE permitido para usuários da empresa (admin/comprador)
+-- Observação: não restringe quais colunas podem ser atualizadas via RLS.
+-- Um trigger existente já protege alterações de fields de integridade.
+CREATE POLICY company_users_can_update_order_item_invoices
+ON public.order_item_invoices
+FOR UPDATE
+TO authenticated
+USING (
+  EXISTS (
+    SELECT 1
+    FROM private.user_access_cache uac
+    JOIN public.order_items oi ON oi.id = order_item_invoices.order_item_id
+    JOIN public.orders o ON o.id = oi.order_id
+    WHERE
+      uac.user_id = (select auth.uid())
+      AND uac.is_active = true
+      AND uac.role_name IN ('admin', 'comprador')
+      AND o.company_id = uac.company_id
+  )
+)
+WITH CHECK (
+  EXISTS (
+    SELECT 1
+    FROM private.user_access_cache uac
+    JOIN public.order_items oi ON oi.id = order_item_invoices.order_item_id
+    JOIN public.orders o ON o.id = oi.order_id
+    WHERE
+      uac.user_id = (select auth.uid())
+      AND uac.is_active = true
+      AND uac.role_name IN ('admin', 'comprador')
+      AND o.company_id = uac.company_id
+  )
+);
+
+-- UPDATE permitido para usuários de fornecedor
+CREATE POLICY suppliers_can_update_order_item_invoices
+ON public.order_item_invoices
+FOR UPDATE
+TO authenticated
+USING (
+  EXISTS (
+    SELECT 1
+    FROM private.user_access_cache uac
+    JOIN public.order_items oi ON oi.id = order_item_invoices.order_item_id
+    JOIN public.orders o ON o.id = oi.order_id
+    WHERE
+      uac.user_id = (select auth.uid())
+      AND uac.is_active = true
+      AND uac.role_name = 'fornecedor'
+      AND o.supplier_id = uac.supplier_id
+  )
+)
+WITH CHECK (
+  EXISTS (
+    SELECT 1
+    FROM private.user_access_cache uac
+    JOIN public.order_items oi ON oi.id = order_item_invoices.order_item_id
+    JOIN public.orders o ON o.id = oi.order_id
+    WHERE
+      uac.user_id = (select auth.uid())
+      AND uac.is_active = true
+      AND uac.role_name = 'fornecedor'
+      AND o.supplier_id = uac.supplier_id
+  )
+);
+
 CREATE POLICY superadmins_can_manage_all_order_item_invoices
 ON public.order_item_invoices
 FOR ALL
