@@ -9,5 +9,9 @@ Edge Function that validates supplier contact/email, then requests a Supabase Au
 
 ## Response shape
 
-- Valid or invalid email: often `{ success: true }` at HTTP 200 by design (email enumeration mitigation).
+- Valid or invalid email (no `supplier_contact` / no `supplier_user`): `{ success: true }` at HTTP 200 by design (email enumeration mitigation).
+- Magic link sent: `{ success: true }` at HTTP 200.
+- Cooldown active (same `supplier_user` requested again within `MAGIC_LINK_COOLDOWN_MS`): HTTP **429** with `{ success: false, code: "MAGIC_LINK_COOLDOWN", error, retry_after_seconds }`.
+- Supabase Auth `over_email_send_rate_limit`: HTTP **429** with `{ success: false, code: "EMAIL_SEND_RATE_LIMIT", error }`.
+- Other Auth errors sending OTP: HTTP **502** with `{ success: false, code: "MAGIC_LINK_SEND_FAILED", error }`.
 - Missing body field: HTTP 400 with `{ error: "..." }` (Portuguese product copy).

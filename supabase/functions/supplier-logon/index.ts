@@ -4,6 +4,7 @@ import {
   isEmailSendRateLimited,
   isWithinMagicLinkCooldown,
   MAGIC_LINK_COOLDOWN_MS,
+  magicLinkCooldownRemainingSeconds,
 } from "../_shared/magic_link_cooldown.ts";
 
 const FOLLOWUP_URL = Deno.env.get("FOLLOWUP_URL")!;
@@ -75,8 +76,28 @@ Deno.serve(async (req: Request): Promise<Response> => {
         nowMs,
       )
     ) {
-      return jsonResponse({ success: true }, 200, corsHeaders);
+      const retryAfter = magicLinkCooldownRemainingSeconds(
+        supplierUser.last_magic_link_requested_at as string | null,
+        MAGIC_LINK_COOLDOWN_MS,
+        nowMs,
+      );
+      return jsonResponse(
+        {
+          success: false,
+          code: "MAGIC_LINK_COOLDOWN",
+          error:
+            "Aguarde alguns segundos antes de solicitar outro link de acesso.",
+          retry_after_seconds: retryAfter,
+        },
+        429,
+        corsHeaders,
+      );
     }
+
+    console.log(
+      "supplier-logon: signInWithOtp emailRedirectTo (FOLLOWUP_URL)",
+      FOLLOWUP_URL,
+    );
 
     const { error: linkError } = await supabase.auth.signInWithOtp({
       email: user_email,
@@ -92,10 +113,27 @@ Deno.serve(async (req: Request): Promise<Response> => {
           `Magic link rate limited for ${user_email}:`,
           linkError.message,
         );
-      } else {
-        console.error(`Failed to send magic link for ${user_email}:`, linkError);
+        return jsonResponse(
+          {
+            success: false,
+            code: "EMAIL_SEND_RATE_LIMIT",
+            error:
+              "Muitas solicitações em pouco tempo. Tente novamente em alguns minutos.",
+          },
+          429,
+          corsHeaders,
+        );
       }
-      return jsonResponse({ success: true }, 200, corsHeaders);
+      console.error(`Failed to send magic link for ${user_email}:`, linkError);
+      return jsonResponse(
+        {
+          success: false,
+          code: "MAGIC_LINK_SEND_FAILED",
+          error: "Não foi possível enviar o link. Tente novamente mais tarde.",
+        },
+        502,
+        corsHeaders,
+      );
     }
 
     const { error: updateError } = await supabase
