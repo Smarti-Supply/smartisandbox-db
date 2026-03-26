@@ -371,6 +371,24 @@ USING (
   )
 );
 
+CREATE POLICY client_buyers_can_read_own_supplier_users
+ON public.supplier_users
+FOR SELECT
+TO authenticated
+USING (
+  EXISTS (
+    SELECT 1
+    FROM private.user_access_cache uac
+    JOIN public.supplier_contacts sc ON sc.id = supplier_users.supplier_contact_id
+    JOIN public.suppliers s ON sc.supplier_id = s.id
+    WHERE
+      uac.user_id = (select auth.uid())
+      AND uac.role_name = 'comprador'
+      AND uac.is_active = true
+      AND s.company_id = uac.company_id
+  )
+);
+
 CREATE POLICY client_admins_can_insert_supplier_users
 ON public.supplier_users
 FOR INSERT
