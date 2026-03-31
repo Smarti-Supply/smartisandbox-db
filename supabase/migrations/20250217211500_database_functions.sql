@@ -4416,60 +4416,6 @@ BEGIN
 END;
 $$;
 
--- ╭────────────────────────────────────────────────────────────────────╮
--- ┃  Follow-up: alertas operacionais (notify-ops via Edge)             ┃
--- ╰────────────────────────────────────────────────────────────────────╯
--- Edge notify-ops / send-followup: OPS_ALERT_FROM, RESEND_API_KEY, etc.
-
-CREATE OR REPLACE FUNCTION private.fn_notify_ops_alert_json(p_body JSONB)
-RETURNS VOID
-LANGUAGE plpgsql
-SECURITY DEFINER
-SET search_path TO 'public', 'vault', 'private'
-AS $$
-DECLARE
-  edge_token       TEXT;
-  service_role_key TEXT;
-  supabase_url     TEXT;
-  v_response       JSONB;
-BEGIN
-  IF p_body IS NULL OR p_body = '{}'::JSONB THEN
-    RETURN;
-  END IF;
-
-  SELECT decrypted_secret INTO edge_token
-  FROM vault.decrypted_secrets
-  WHERE name = 'INTERNAL_EDGE_TOKEN';
-
-  SELECT decrypted_secret INTO service_role_key
-  FROM vault.decrypted_secrets
-  WHERE name = 'SUPABASE_SERVICE_ROLE_KEY';
-
-  SELECT decrypted_secret INTO supabase_url
-  FROM vault.decrypted_secrets
-  WHERE name = 'SUPABASE_URL';
-
-  IF edge_token IS NULL OR service_role_key IS NULL OR supabase_url IS NULL THEN
-    RAISE WARNING 'fn_notify_ops_alert_json: secrets ausentes (vault)';
-    RETURN;
-  END IF;
-
-  SELECT net.http_post(
-    url     := supabase_url || '/functions/v1/notify-ops',
-    headers := jsonb_build_object(
-      'Content-Type', 'application/json',
-      'Authorization', 'Bearer ' || service_role_key,
-      'edge-token', edge_token
-    ),
-    body    := p_body
-  ) INTO v_response;
-
-  IF COALESCE((v_response ->> 'status')::INT, 0) >= 400 THEN
-    RAISE WARNING 'notify-ops HTTP error: %', v_response;
-  END IF;
-END;
-$$;
-
 CREATE OR REPLACE FUNCTION private.fn_execute_scheduled_followups_with_alert()
 RETURNS TABLE (
   processed_rules INT,
@@ -4484,18 +4430,8 @@ BEGIN
   RETURN QUERY SELECT * FROM private.fn_execute_scheduled_followups();
 EXCEPTION
   WHEN OTHERS THEN
-    PERFORM private.fn_notify_ops_alert_json(
-      jsonb_build_object(
-        'subject_suffix', 'SQL fn_execute_scheduled_followups',
-        'what', 'O job que identifica regras e enfileira follow-ups terminou com erro no banco.',
-        'where', 'private.fn_execute_scheduled_followups (cron execute-scheduled-followups).',
-        'impact', 'Novos itens podem não ter sido adicionados à followup_queue naquela execução.',
-        'error', SQLERRM,
-        'context', '—',
-        'order_numbers', '[]'::JSONB,
-        'suggestion', 'Ver logs do Postgres / job pg_cron e a query que falhou.'
-      )
-    );
+    -- Apenas logamos no Postgres; não disparamos notify-ops aqui.
+    RAISE NOTICE 'fn_execute_scheduled_followups_with_alert error: %', SQLERRM;
     RAISE;
 END;
 $$;
@@ -4515,18 +4451,8 @@ BEGIN
   RETURN QUERY SELECT * FROM private.fn_process_followup_queue(p_batch_size);
 EXCEPTION
   WHEN OTHERS THEN
-    PERFORM private.fn_notify_ops_alert_json(
-      jsonb_build_object(
-        'subject_suffix', 'SQL fn_process_followup_queue',
-        'what', 'O processamento da fila de follow-ups falhou com exceção no banco ou na chamada à Edge.',
-        'where', 'private.fn_process_followup_queue (cron process-followup-queue) / fn_send_followup_batch_to_edge.',
-        'impact', 'O batch pode ter sido marcado com retry ou falha conforme a lógica existente; verificar fila e Edge.',
-        'error', SQLERRM,
-        'context', format('batch_size=%s', p_batch_size),
-        'order_numbers', '[]'::JSONB,
-        'suggestion', 'Verificar status da Edge send-followup, secrets vault (URL/token) e logs da função.'
-      )
-    );
+    -- Apenas logamos no Postgres; não disparamos notify-ops aqui.
+    RAISE NOTICE 'fn_process_followup_queue_with_alert error: %', SQLERRM;
     RAISE;
 END;
 $$;
@@ -4545,18 +4471,8 @@ BEGIN
   RETURN QUERY SELECT * FROM private.fn_cleanup_followup_queue();
 EXCEPTION
   WHEN OTHERS THEN
-    PERFORM private.fn_notify_ops_alert_json(
-      jsonb_build_object(
-        'subject_suffix', 'SQL fn_cleanup_followup_queue',
-        'what', 'A limpeza agendada da followup_queue falhou.',
-        'where', 'private.fn_cleanup_followup_queue (cron cleanup-followup-queue).',
-        'impact', 'Registros antigos podem não ter sido removidos.',
-        'error', SQLERRM,
-        'context', '—',
-        'order_numbers', '[]'::JSONB,
-        'suggestion', 'Verificar locks, permissões e integridade da tabela followup_queue.'
-      )
-    );
+    -- Apenas logamos no Postgres; não disparamos notify-ops aqui.
+    RAISE NOTICE 'fn_cleanup_followup_queue_with_alert error: %', SQLERRM;
     RAISE;
 END;
 $$;

@@ -50,7 +50,7 @@ SELECT cron.schedule(
 -- ╰────────────────────────────────────────────────────────────────────╯
 
 -- Cron para identificar e enfileirar follow-ups agendados a cada minuto
--- (wrapper dispara notify-ops em caso de exceção não tratada)
+-- (erros são tratados apenas via logs no banco; notify-ops é exclusivo da Edge send-followup)
 SELECT cron.schedule(
   'execute-scheduled-followups',
   '* * * * *',  -- Todo início de hora (UTC)

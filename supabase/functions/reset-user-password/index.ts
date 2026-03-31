@@ -30,7 +30,7 @@ Deno.serve(async (req: Request): Promise<Response> => {
       );
     }
 
-    // Verifica se o fornecedor existe
+    // Verifica se existe um usuário interno (company_user) com esse e-mail
     const { data: companyUser, error: userError } = await supabase
       .schema("public")
       .from("company_users")
@@ -38,30 +38,60 @@ Deno.serve(async (req: Request): Promise<Response> => {
       .eq("email", user_email)
       .single();
 
-    if (userError || !companyUser) {
-      // Não envia erro detalhado para evitar enumeração de e-mails
-      return new Response(JSON.stringify({ success: true }), {
-        status: 200,
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
-    }
+    if (!userError && companyUser) {
+      // Usuário interno encontrado: gera link de redefinição de senha
+      const { data: _resetSuccess, error: resetError } =
+        await supabase.auth.resetPasswordForEmail(
+          user_email,
+          {
+            redirectTo: RESET_PASSWORD_URL,
+          },
+        );
 
-    // Gera magic link
-    const { data: _resetSuccess, error: resetError } = await supabase.auth.resetPasswordForEmail(
-      user_email,
-      {
-        redirectTo: RESET_PASSWORD_URL,
+      if (resetError) {
+        console.error(
+          `Erro ao enviar redefinição de senha para ${user_email}:`,
+          resetError,
+        );
       }
-    );
+    } else {
+      // Tenta fluxo para fornecedor (supplier) com o mesmo e-mail
+      const { data: supplierContact, error: supplierContactError } =
+        await supabase
+          .schema("public")
+          .from("supplier_contacts")
+          .select("id")
+          .eq("email", user_email)
+          .single();
 
-    if (resetError) {
-      console.error(`Erro ao enviar redefinição de senha para ${user_email}:`, resetError);
-      return new Response(JSON.stringify({ success: true }), {
-        status: 200,
-        headers: { ...corsHeaders, "Content-Type": "application/json" },
-      });
+      if (!supplierContactError && supplierContact) {
+        const { data: supplierUser, error: supplierUserError } = await supabase
+          .schema("public")
+          .from("supplier_users")
+          .select("id")
+          .eq("supplier_contact_id", supplierContact.id)
+          .single();
+
+        if (!supplierUserError && supplierUser) {
+          const { data: _resetSuccess, error: resetError } =
+            await supabase.auth.resetPasswordForEmail(
+              user_email,
+              {
+                redirectTo: RESET_PASSWORD_URL,
+              },
+            );
+
+          if (resetError) {
+            console.error(
+              `Erro ao enviar redefinição de senha para fornecedor ${user_email}:`,
+              resetError,
+            );
+          }
+        }
+      }
     }
 
+    // Nunca expõe se o e-mail é válido ou não; sempre retorna sucesso
     return new Response(JSON.stringify({ success: true }), {
       status: 200,
       headers: { ...corsHeaders, "Content-Type": "application/json" },
