@@ -1,8 +1,240 @@
 {
-  "imports": {
-    "supabase": "jsr:@supabase/supabase-js@2",
-    "jspdf": "npm:jspdf@2.5.2",
-    "jspdf-autotable": "npm:jspdf-autotable@3.8.2"
+  "version": "5",
+  "specifiers": {
+    "jsr:@supabase/functions-js@^0.0.0-automated": "0.0.0-jsr-test.1",
+    "jsr:@supabase/supabase-js@2": "2.93.1",
+    "npm:@supabase/auth-js@2.93.1": "2.93.1",
+    "npm:@supabase/postgrest-js@2.93.1": "2.93.1",
+    "npm:@supabase/realtime-js@2.93.1": "2.93.1",
+    "npm:@supabase/storage-js@2.93.1": "2.93.1",
+    "npm:@types/node@*": "22.15.15",
+    "npm:jspdf-autotable@3.8.2": "3.8.2_jspdf@2.5.2",
+    "npm:jspdf@2.5.2": "2.5.2"
+  },
+  "jsr": {
+    "@supabase/functions-js@0.0.0-jsr-test.1": {
+      "integrity": "b1b37924af1f0011b4753201e1585a37b030e996c6682492e02575eb27d902b2"
+    },
+    "@supabase/supabase-js@2.93.1": {
+      "integrity": "7d280e54ce789e41dcdba1ed1dc42b0c637a0d22578d4552e11abe9419c75e39",
+      "dependencies": [
+        "jsr:@supabase/functions-js",
+        "npm:@supabase/auth-js",
+        "npm:@supabase/postgrest-js",
+        "npm:@supabase/realtime-js",
+        "npm:@supabase/storage-js"
+      ]
+    }
+  },
+  "npm": {
+    "@babel/runtime@7.28.6": {
+      "integrity": "sha512-05WQkdpL9COIMz4LjTxGpPNCdlpyimKppYNoJ5Di5EUObifl8t4tuLuUBBZEpoLYOmfvIWrsp9fCl0HoPRVTdA=="
+    },
+    "@supabase/auth-js@2.93.1": {
+      "integrity": "sha512-pC0Ek4xk4z6q7A/3+UuZ/eYgfFUUQTg3DhapzrAgJnFGDJDFDyGCj6v9nIz8+3jfLqSZ3QKGe6AoEodYjShghg==",
+      "dependencies": [
+        "tslib"
+      ]
+    },
+    "@supabase/postgrest-js@2.93.1": {
+      "integrity": "sha512-uRKKQJBDnfi6XFNFPNMh9+u3HT2PCgp065PcMPmG7e0xGuqvLtN89QxO2/SZcGbw2y1+mNBz0yUs5KmyNqF2fA==",
+      "dependencies": [
+        "tslib"
+      ]
+    },
+    "@supabase/realtime-js@2.93.1": {
+      "integrity": "sha512-2WaP/KVHPlQDjWM6qe4wOZz6zSRGaXw1lfXf4thbfvk3C3zPPKqXRyspyYnk3IhphyxSsJ2hQ/cXNOz48008tg==",
+      "dependencies": [
+        "@types/phoenix",
+        "@types/ws",
+        "tslib",
+        "ws"
+      ]
+    },
+    "@supabase/storage-js@2.93.1": {
+      "integrity": "sha512-3KVwd4S1i1BVPL6KIywe5rnruNQXSkLyvrdiJmwnqwbCcDujQumARdGWBPesqCjOPKEU2M9ORWKAsn+2iLzquA==",
+      "dependencies": [
+        "iceberg-js",
+        "tslib"
+      ]
+    },
+    "@types/node@22.15.15": {
+      "integrity": "sha512-R5muMcZob3/Jjchn5LcO8jdKwSCbzqmPB6ruBxMcf9kbxtniZHP327s6C37iOfuw8mbKK3cAQa7sEl7afLrQ8A==",
+      "dependencies": [
+        "undici-types"
+      ]
+    },
+    "@types/phoenix@1.6.7": {
+      "integrity": "sha512-oN9ive//QSBkf19rfDv45M7eZPi0eEXylht2OLEXicu5b4KoQ1OzXIw+xDSGWxSxe1JmepRR/ZH283vsu518/Q=="
+    },
+    "@types/raf@3.4.3": {
+      "integrity": "sha512-c4YAvMedbPZ5tEyxzQdMoOhhJ4RD3rngZIdwC2/qDN3d7JpEhB6fiBRKVY1lg5B7Wk+uPBjn5f39j1/2MY1oOw=="
+    },
+    "@types/ws@8.18.1": {
+      "integrity": "sha512-ThVF6DCVhA8kUGy+aazFQ4kXQ7E1Ty7A3ypFOe0IcJV8O/M511G99AW24irKrW56Wt44yG9+ij8FaqoBGkuBXg==",
+      "dependencies": [
+        "@types/node"
+      ]
+    },
+    "atob@2.1.2": {
+      "integrity": "sha512-Wm6ukoaOGJi/73p/cl2GvLjTI5JM1k/O14isD73YML8StrH/7/lRFgmg8nICZgD3bZZvjwCGxtMOD3wWNAu8cg==",
+      "bin": true
+    },
+    "base64-arraybuffer@1.0.2": {
+      "integrity": "sha512-I3yl4r9QB5ZRY3XuJVEPfc2XhZO6YweFPI+UovAzn+8/hb3oJ6lnysaFcjVpkCPfVWFUDvoZ8kmVDP7WyRtYtQ=="
+    },
+    "btoa@1.2.1": {
+      "integrity": "sha512-SB4/MIGlsiVkMcHmT+pSmIPoNDoHg+7cMzmt3Uxt628MTz2487DKSqK/fuhFBrkuqrYv5UCEnACpF4dTFNKc/g==",
+      "bin": true
+    },
+    "canvg@3.0.11": {
+      "integrity": "sha512-5ON+q7jCTgMp9cjpu4Jo6XbvfYwSB2Ow3kzHKfIyJfaCAOHLbdKPQqGKgfED/R5B+3TFFfe8pegYA+b423SRyA==",
+      "dependencies": [
+        "@babel/runtime",
+        "@types/raf",
+        "core-js",
+        "raf",
+        "regenerator-runtime",
+        "rgbcolor",
+        "stackblur-canvas",
+        "svg-pathdata"
+      ]
+    },
+    "core-js@3.48.0": {
+      "integrity": "sha512-zpEHTy1fjTMZCKLHUZoVeylt9XrzaIN2rbPXEt0k+q7JE5CkCZdo6bNq55bn24a69CH7ErAVLKijxJja4fw+UQ==",
+      "scripts": true
+    },
+    "css-line-break@2.1.0": {
+      "integrity": "sha512-FHcKFCZcAha3LwfVBhCQbW2nCNbkZXn7KVUJcsT5/P8YmfsVja0FMPJr0B903j/E69HUphKiV9iQArX8SDYA4w==",
+      "dependencies": [
+        "utrie"
+      ]
+    },
+    "dompurify@2.5.8": {
+      "integrity": "sha512-o1vSNgrmYMQObbSSvF/1brBYEQPHhV1+gsmrusO7/GXtp1T9rCS8cXFqVxK/9crT1jA6Ccv+5MTSjBNqr7Sovw=="
+    },
+    "fflate@0.8.2": {
+      "integrity": "sha512-cPJU47OaAoCbg0pBvzsgpTPhmhqI5eJjh/JIu8tPj5q+T7iLvW/JAYUqmE7KOB4R1ZyEhzBaIQpQpardBF5z8A=="
+    },
+    "html2canvas@1.4.1": {
+      "integrity": "sha512-fPU6BHNpsyIhr8yyMpTLLxAbkaK8ArIBcmZIRiBLiDhjeqvXolaEmDGmELFuX9I4xDcaKKcJl+TKZLqruBbmWA==",
+      "dependencies": [
+        "css-line-break",
+        "text-segmentation"
+      ]
+    },
+    "iceberg-js@0.8.1": {
+      "integrity": "sha512-1dhVQZXhcHje7798IVM+xoo/1ZdVfzOMIc8/rgVSijRK38EDqOJoGula9N/8ZI5RD8QTxNQtK/Gozpr+qUqRRA=="
+    },
+    "jspdf-autotable@3.8.2_jspdf@2.5.2": {
+      "integrity": "sha512-zW1ix99/mtR4MbIni7IqvrpfHmuTaICl6iv6wqjRN86Nxtwaw/QtOeDbpXqYSzHIJK9JvgtLM283sc5x+ipkJg==",
+      "dependencies": [
+        "jspdf"
+      ]
+    },
+    "jspdf@2.5.2": {
+      "integrity": "sha512-myeX9c+p7znDWPk0eTrujCzNjT+CXdXyk7YmJq5nD5V7uLLKmSXnlQ/Jn/kuo3X09Op70Apm0rQSnFWyGK8uEQ==",
+      "dependencies": [
+        "@babel/runtime",
+        "atob",
+        "btoa",
+        "fflate"
+      ],
+      "optionalDependencies": [
+        "canvg",
+        "core-js",
+        "dompurify",
+        "html2canvas"
+      ]
+    },
+    "performance-now@2.1.0": {
+      "integrity": "sha512-7EAHlyLHI56VEIdK57uwHdHKIaAGbnXPiw0yWbarQZOKaKpvUIgW0jWRVLiatnM+XXlSwsanIBH/hzGMJulMow=="
+    },
+    "raf@3.4.1": {
+      "integrity": "sha512-Sq4CW4QhwOHE8ucn6J34MqtZCeWFP2aQSmrlroYgqAV1PjStIhJXxYuTgUIfkEk7zTLjmIjLmU5q+fbD1NnOJA==",
+      "dependencies": [
+        "performance-now"
+      ]
+    },
+    "regenerator-runtime@0.13.11": {
+      "integrity": "sha512-kY1AZVr2Ra+t+piVaJ4gxaFaReZVH40AKNo7UCX6W+dEwBo/2oZJzqfuN1qLq1oL45o56cPaTXELwrTh8Fpggg=="
+    },
+    "rgbcolor@1.0.1": {
+      "integrity": "sha512-9aZLIrhRaD97sgVhtJOW6ckOEh6/GnvQtdVNfdZ6s67+3/XwLS9lBcQYzEEhYVeUowN7pRzMLsyGhK2i/xvWbw=="
+    },
+    "stackblur-canvas@2.7.0": {
+      "integrity": "sha512-yf7OENo23AGJhBriGx0QivY5JP6Y1HbrrDI6WLt6C5auYZXlQrheoY8hD4ibekFKz1HOfE48Ww8kMWMnJD/zcQ=="
+    },
+    "svg-pathdata@6.0.3": {
+      "integrity": "sha512-qsjeeq5YjBZ5eMdFuUa4ZosMLxgr5RZ+F+Y1OrDhuOCEInRMA3x74XdBtggJcj9kOeInz0WE+LgCPDkZFlBYJw=="
+    },
+    "text-segmentation@1.0.3": {
+      "integrity": "sha512-iOiPUo/BGnZ6+54OsWxZidGCsdU8YbE4PSpdPinp7DeMtUJNJBoJ/ouUSTJjHkh1KntHaltHl/gDs2FC4i5+Nw==",
+      "dependencies": [
+        "utrie"
+      ]
+    },
+    "tslib@2.8.1": {
+      "integrity": "sha512-oJFu94HQb+KVduSUQL7wnpmqnfmLsOA/nAh6b6EH0wCEoK0/mPeXU6c3wKDV83MkOuHPRHtSXKKU99IBazS/2w=="
+    },
+    "undici-types@6.21.0": {
+      "integrity": "sha512-iwDZqg0QAGrg9Rav5H4n0M64c3mkR59cJ6wQp+7C4nI0gsmExaedaYLNO44eT4AtBBwjbTiGPMlt2Md0T9H9JQ=="
+    },
+    "utrie@1.0.2": {
+      "integrity": "sha512-1MLa5ouZiOmQzUbjbu9VmjLzn1QLXBhwpUa7kdLUQK+KQ5KA9I1vk5U4YHe/X2Ch7PYnJfWuWT+VbuxbGwljhw==",
+      "dependencies": [
+        "base64-arraybuffer"
+      ]
+    },
+    "ws@8.19.0": {
+      "integrity": "sha512-blAT2mjOEIi0ZzruJfIhb3nps74PRWTCz1IjglWEEpQl5XS/UNama6u2/rjFkDDouqr4L67ry+1aGIALViWjDg=="
+    }
+  },
+  "redirects": {
+    "https://esm.sh/@supabase/supabase-js@2": "https://esm.sh/@supabase/supabase-js@2.49.4",
+    "https://esm.sh/@types/raf@~3.4.3/index.d.ts": "https://esm.sh/@types/raf@3.4.3/index.d.ts",
+    "https://esm.sh/canvg?target=denonext": "https://esm.sh/canvg@4.0.3?target=denonext",
+    "https://esm.sh/dompurify?target=denonext": "https://esm.sh/dompurify@3.3.1?target=denonext",
+    "https://esm.sh/fflate@^0.8.1?target=denonext": "https://esm.sh/fflate@0.8.2?target=denonext",
+    "https://esm.sh/html2canvas?target=denonext": "https://esm.sh/html2canvas@1.4.1?target=denonext",
+    "https://esm.sh/jspdf@^2.5.1?target=denonext": "https://esm.sh/jspdf@2.5.2?target=denonext",
+    "https://esm.sh/performance-now@^2.1.0?target=denonext": "https://esm.sh/performance-now@2.1.0?target=denonext",
+    "https://esm.sh/raf@^3.4.1?target=denonext": "https://esm.sh/raf@3.4.1?target=denonext",
+    "https://esm.sh/rgbcolor@^1.0.1?target=denonext": "https://esm.sh/rgbcolor@1.0.1?target=denonext",
+    "https://esm.sh/stackblur-canvas@^2.0.0?target=denonext": "https://esm.sh/stackblur-canvas@2.7.0?target=denonext",
+    "https://esm.sh/svg-pathdata@^6.0.3?target=denonext": "https://esm.sh/svg-pathdata@6.0.3?target=denonext"
+  },
+  "remote": {
+    "https://esm.sh/@supabase/supabase-js@2.49.4": "d52c4d06946766d328fdd0ac2e007f52bb6d2ef7ce6103ad9f0f57d92b73e978",
+    "https://esm.sh/canvg@4.0.3/denonext/canvg.mjs": "963ae6646373caece9a5e1b0190aad76f3424a75c65f5705ffc840d8bc8fa478",
+    "https://esm.sh/canvg@4.0.3?target=denonext": "3d4cfa967ecff066d00121a53be6d4afcc2e1256279204c1a1707d6617b0711e",
+    "https://esm.sh/dompurify@3.3.1/denonext/dompurify.mjs": "4f2cf085722e20c77a97d45319d47146de6d45ea0781b3475968e7d2bea8a9af",
+    "https://esm.sh/dompurify@3.3.1?target=denonext": "3ec1022c24fa2433ae8918519849e4659064ded4cbfd975d68c8a202b7509150",
+    "https://esm.sh/fflate@0.8.2/denonext/fflate.mjs": "84afaa7491d754b566dd8608dcc784e7fdd4f0342e2c5b0bd1442e77782ec1a2",
+    "https://esm.sh/fflate@0.8.2?target=denonext": "e0cdd268850b4eac9ef9f188a3b4c5c9dd3ebd0f66c4006a13911b2a0c0512bb",
+    "https://esm.sh/html2canvas@1.4.1/denonext/html2canvas.mjs": "7d101f94117b8610969abc4533ceefb2ab886ed5d39d0eb5bfe9de7c73828e0a",
+    "https://esm.sh/html2canvas@1.4.1?target=denonext": "7c7506658947c798388a68425ade96cfca25110f0358cd1ad56a58972a7167f2",
+    "https://esm.sh/jspdf-autotable@3.8.2": "7d6bcbee408015edc51b3b0dfd0eff0d52c97f1b3d7839884647d4ed4ae4eb04",
+    "https://esm.sh/jspdf-autotable@3.8.2/denonext/jspdf-autotable.mjs": "a6977ae238ae8991bfcb46972b50d5113cb61822a672c20ef1f626c89d8e5d67",
+    "https://esm.sh/jspdf@2.5.2": "405759a59c324ef12ec4fb7680f278a8e0c92a51e0afd678fb7eb8f1584e4713",
+    "https://esm.sh/jspdf@2.5.2/denonext/jspdf.mjs": "32afa07da2864e2aa2a341cfe08645fd8cd75754ed311156474b4f43cc88bd51",
+    "https://esm.sh/jspdf@2.5.2?target=denonext": "405759a59c324ef12ec4fb7680f278a8e0c92a51e0afd678fb7eb8f1584e4713",
+    "https://esm.sh/performance-now@2.1.0/denonext/performance-now.mjs": "865e852a187e5ac0622bc803aa0e959f633a71f2b6c297cda8806961febe889b",
+    "https://esm.sh/performance-now@2.1.0?target=denonext": "19f5f27e3631f9a471d73e9bf3f3731cd099701a7656817ee92f922a9c0f3272",
+    "https://esm.sh/raf@3.4.1/denonext/raf.mjs": "89ea0c5c4b2f095fe7d39fd1e846660d7e2c15e4ccb1d24d81178b1770f23ab2",
+    "https://esm.sh/raf@3.4.1?target=denonext": "c23d7244deee17f4abdc9c44677d4a932937251b962a364a81a9db222dafd1de",
+    "https://esm.sh/rgbcolor@1.0.1/denonext/rgbcolor.mjs": "d13ec6ea5a7f7e20676b031dcad6c12ab429d2a5a85099f48b4e55c899619010",
+    "https://esm.sh/rgbcolor@1.0.1?target=denonext": "c13ff0d3264d1fb23d772400591f606440ee0c9a831e5c4534eebe1f324f0794",
+    "https://esm.sh/stackblur-canvas@2.7.0/denonext/stackblur-canvas.mjs": "015ed7547ae865dbb8359c8e590ccd3f92fcde395a43bb664c3c2bf4481442ff",
+    "https://esm.sh/stackblur-canvas@2.7.0?target=denonext": "10384fa4eba4071e7f139c74dbeae53504adf89ec023efde6b2e12d8384bd64a",
+    "https://esm.sh/svg-pathdata@6.0.3/denonext/svg-pathdata.mjs": "606a9a8fd87fe0d6f350d08eb6c82f8671cf608a4b43edf6af46761cb59279c7",
+    "https://esm.sh/svg-pathdata@6.0.3?target=denonext": "1494f13da34d93f557f58931a30bab74697ec0eabbdb6d1b4df0c00956ceed0a"
+  },
+  "workspace": {
+    "dependencies": [
+      "jsr:@supabase/supabase-js@2",
+      "npm:jspdf-autotable@3.8.2",
+      "npm:jspdf@2.5.2"
+    ]
   }
 }
-

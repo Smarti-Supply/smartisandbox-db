@@ -44,6 +44,21 @@ function formatDateTime(dtStr: string | null | undefined): string {
   }
 }
 
+/** Helvetica padrão do jsPDF não mede bem vários Unicode; normaliza para evitar quebra/espçamento estranho no PDF. */
+function normalizeTextForPdf(text: string): string {
+  let s = text
+    .replace(/\u00a0/g, " ")
+    .replace(/[\u200b-\u200d\ufeff]/g, "")
+    .replace(/\u03bc/gi, "u")
+    .replace(/\u00b5/g, "u")
+    .replace(/\u2014/g, "-")
+    .replace(/\u2013/g, "-")
+    .replace(/\u2212/g, "-");
+  const lines = s.split(/\r?\n/).map((line) => line.replace(/[ \t]+/g, " ").trimEnd());
+  s = lines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+  return s;
+}
+
 function formatUser(
   userNome: string | null | undefined,
   userEmail: string | null | undefined
@@ -145,17 +160,23 @@ function createTimelineEvents(
     const supplierContacts = (log.supplier_contacts as string[]) ?? [];
     const userObservations = (log.user_observations as string) ?? "";
     const sentBy = (log.sent_by as string) ?? "";
+    const senderFormatted = formatUser(
+      log.sent_by_name as string,
+      log.sent_by_email as string
+    );
+    const enviadoPor = isAutomatic
+      ? "Sistema (automático)"
+      : senderFormatted !== "-"
+        ? senderFormatted
+        : sentBy.trim()
+          ? `Usuário (${sentBy})`
+          : "Usuário";
     const ruleName = (log.rule_name as string) ?? "";
     const tipoNotificacao =
       notificationType === "email" ? "Email" : notificationType;
     const contatosStr = supplierContacts.length
       ? supplierContacts.join(", ")
       : "N/A";
-    const enviadoPor = isAutomatic
-      ? "Sistema (automático)"
-      : sentBy
-        ? `Usuário (${sentBy})`
-        : "Usuário";
     const descParts: string[] = [];
     if (ruleName.trim()) {
       descParts.push(`Regra: ${ruleName}`);
@@ -228,6 +249,7 @@ export function generatePdf(
   });
   const pageWidth = doc.internal.pageSize.getWidth();
   const margin = 20;
+  const tableInnerWidth = pageWidth - 2 * margin;
   let y = 20;
 
   doc.setFontSize(18);
@@ -269,25 +291,44 @@ export function generatePdf(
   );
 
   const tableData = events.length
-    ? events.map((e) => [
-        e.displayDate ?? (e.date ? formatDateTime(e.date) : "-"),
-        e.description,
-        e.user,
-      ])
+    ? events.map((e) => {
+        const dataStr = e.displayDate ?? (e.date ? formatDateTime(e.date) : "-");
+        return [
+          normalizeTextForPdf(String(dataStr)),
+          normalizeTextForPdf(String(e.description)),
+          normalizeTextForPdf(String(e.user)),
+        ];
+      })
     : [["-", "Nenhum evento registrado", "-"]];
+
+  const colDateW = Math.round(tableInnerWidth * 0.18 * 100) / 100;
+  const colUserW = Math.round(tableInnerWidth * 0.22 * 100) / 100;
+  const colDescW = Math.round((tableInnerWidth - colDateW - colUserW) * 100) / 100;
 
   autoTable(doc, {
     startY: y,
     head: [["Data", "Descrição", "Usuário"]],
     body: tableData,
     theme: "grid",
-    headStyles: { fillColor: [224, 224, 224], textColor: [0, 0, 0] },
+    tableWidth: tableInnerWidth,
+    styles: {
+      overflow: "linebreak",
+      valign: "top",
+      halign: "left",
+      cellPadding: 1.5,
+    },
+    bodyStyles: { halign: "left" },
+    headStyles: {
+      fillColor: [224, 224, 224],
+      textColor: [0, 0, 0],
+      halign: "left",
+    },
     alternateRowStyles: { fillColor: [245, 245, 245] },
     margin: { left: margin, right: margin },
     columnStyles: {
-      0: { cellWidth: 35 },
-      1: { cellWidth: 100 },
-      2: { cellWidth: 45 },
+      0: { cellWidth: colDateW, halign: "left" },
+      1: { cellWidth: colDescW, halign: "left" },
+      2: { cellWidth: colUserW, halign: "left" },
     },
   });
 
