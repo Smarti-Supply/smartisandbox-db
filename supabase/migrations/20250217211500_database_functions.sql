@@ -2076,7 +2076,9 @@ $$;
 -- Coluna opcional para filtrar follow-up por responsável (ex.: Transpetro: supplier_letter)
 ALTER TABLE public.company_users ADD COLUMN IF NOT EXISTS supplier_letter TEXT NULL;
 
--- Função para criar payload para enviar e-mails de follow-up
+-- Função para criar payload para enviar e-mails de follow-up.
+-- Com order_ids explícitos: não exige item não-final nem regra de default_order_status no cabeçalho;
+-- automação (fn_process_followup_queue, fn_get_targets_*) permanece inalterada.
 CREATE OR REPLACE FUNCTION public.fn_send_payload_followup(
   supplier_ids BIGINT[] DEFAULT NULL,
   order_ids    BIGINT[] DEFAULT NULL,
@@ -2105,7 +2107,10 @@ DECLARE
   order_id_val BIGINT;
   observations_inserted INT := 0;
   observations_failed INT := 0;
+  v_manual_explicit_orders BOOLEAN;
 BEGIN
+  v_manual_explicit_orders := (order_ids IS NOT NULL AND COALESCE(array_length(order_ids, 1), 0) > 0);
+
   -- Captura company_id da sessão
   SELECT uac.company_id INTO v_company_id
   FROM private.user_access_cache uac
@@ -2144,21 +2149,8 @@ BEGIN
   IF order_ids IS NOT NULL AND array_length(order_ids, 1) IS NOT NULL THEN
     SELECT array_agg(DISTINCT o.supplier_id) INTO suppliers_to_process
     FROM public.orders o
-    JOIN public.default_order_status dos ON o.status_id = dos.id
     WHERE o.company_id = v_company_id
-      AND o.id = ANY(order_ids)
-      AND (
-        -- Se tem itens não finais, verifica o status do pedido
-        EXISTS (
-          SELECT 1 FROM public.order_items oi
-          JOIN public.order_item_status ois ON oi.status_id = ois.id
-          WHERE oi.order_id = o.id AND ois.is_final = FALSE
-        )
-        AND (
-          (dos.is_final = FALSE AND dos.code != 'concluido')
-          OR (dos.code = 'concluido')
-        )
-      );
+      AND o.id = ANY(order_ids);
 
   ELSIF supplier_ids IS NOT NULL AND array_length(supplier_ids, 1) IS NOT NULL THEN
     -- Aplicar filtro mesmo quando supplier_ids é fornecido
@@ -2252,7 +2244,7 @@ BEGIN
       FOR orders IN
         SELECT id, order_number, items
           FROM (
-            SELECT 
+            SELECT
               o.id,
               o.supplier_id,
               o.order_number,
@@ -2262,15 +2254,22 @@ BEGIN
             LEFT JOIN public.order_items oi ON oi.order_id = o.id
             WHERE o.company_id = v_company_id
               AND (
-                -- Se tem itens não finais, verifica o status do pedido
-                EXISTS (
-                  SELECT 1 FROM public.order_items oi2
-                  JOIN public.order_item_status ois2 ON oi2.status_id = ois2.id
-                  WHERE oi2.order_id = o.id AND ois2.is_final = FALSE
+                (
+                  v_manual_explicit_orders
+                  AND o.id = ANY(order_ids)
                 )
-                AND (
-                  (dos.is_final = FALSE AND dos.code != 'concluido')
-                  OR (dos.code = 'concluido')
+                OR
+                (
+                  NOT v_manual_explicit_orders
+                  AND EXISTS (
+                    SELECT 1 FROM public.order_items oi2
+                    JOIN public.order_item_status ois2 ON oi2.status_id = ois2.id
+                    WHERE oi2.order_id = o.id AND ois2.is_final = FALSE
+                  )
+                  AND (
+                    (dos.is_final = FALSE AND dos.code != 'concluido')
+                    OR (dos.code = 'concluido')
+                  )
                 )
               )
               AND (
@@ -2316,7 +2315,7 @@ BEGIN
         CONTINUE;
     END;
   END LOOP;
-  
+
   IF jsonb_array_length(payload) = 0 THEN
     PERFORM private.fn_log_process_event(
       p_process_name  := 'send_followup_emails',
@@ -2339,23 +2338,23 @@ BEGIN
     p_status        := 'success',
     p_message       := format('Payload construído com sucesso para %s fornecedores com %s pedidos.',
                              jsonb_array_length(payload),
-                             (SELECT SUM(jsonb_array_length(e->'orders_payload')) 
+                             (SELECT SUM(jsonb_array_length(e->'orders_payload'))
                               FROM jsonb_array_elements(payload) AS e)),
     p_user_id       := v_uid,
     p_metadata      := jsonb_build_object(
                           'total_fornecedores', jsonb_array_length(payload),
-                          'total_pedidos', (SELECT SUM(jsonb_array_length(e->'orders_payload')) 
+                          'total_pedidos', (SELECT SUM(jsonb_array_length(e->'orders_payload'))
                                            FROM jsonb_array_elements(payload) AS e),
                           'executado_para_company_id', v_company_id
                       )
   );
-  
+
   -- Inserir observações se user_observations estiver presente
   IF user_observations IS NOT NULL AND TRIM(user_observations) != '' THEN
     BEGIN
       observations_inserted := 0;
       observations_failed := 0;
-      
+
       -- Iterar sobre todos os fornecedores no payload
       FOR entry IN
         SELECT value FROM jsonb_array_elements(payload)
@@ -2365,7 +2364,7 @@ BEGIN
           SELECT value FROM jsonb_array_elements(entry->'orders_payload')
         LOOP
           order_id_val := (order_entry->>'order_id')::BIGINT;
-          
+
           BEGIN
             -- Chamar fn_insert_client_observations para cada pedido
             PERFORM public.fn_insert_client_observations(
@@ -2393,7 +2392,7 @@ BEGIN
           END;
         END LOOP;
       END LOOP;
-      
+
       -- Log do resultado da inserção de observações
       IF observations_inserted > 0 THEN
         PERFORM private.fn_log_process_event(
@@ -2412,7 +2411,7 @@ BEGIN
       END IF;
     END;
   END IF;
-  
+
   BEGIN
   -- Disparo do e-mail
     PERFORM private.fn_send_followup_emails(payload);
