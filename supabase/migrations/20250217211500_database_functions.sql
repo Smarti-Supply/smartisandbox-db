@@ -4221,6 +4221,7 @@ BEGIN
   -- Buscar followup_logs relacionados ao pedido
   -- Filtrar onde orders_payload contém um objeto com order_id igual ao p_order_id
   -- Incluir rule_name da tabela followup_settings
+  -- sent_by_name / sent_by_email para o PDF (export-order-details) exibir e-mail em vez de UUID
   SELECT COALESCE(jsonb_agg(
     jsonb_build_object(
       'id', fl.id,
@@ -4228,6 +4229,8 @@ BEGIN
       'supplier_contacts', fl.supplier_contacts,
       'sent_at', fl.sent_at,
       'sent_by', CASE WHEN fl.sent_by IS NULL THEN '' ELSE fl.sent_by::TEXT END,
+      'sent_by_name', sent_cu.name,
+      'sent_by_email', sent_cu.email,
       'user_observations', fl.user_observations,
       'supplier_observations', fl.supplier_observations,
       'setting_id', fl.setting_id,
@@ -4242,6 +4245,7 @@ BEGIN
   INTO followup_logs_data
   FROM public.followup_logs fl
   LEFT JOIN public.followup_settings fs ON fs.id = fl.setting_id
+  LEFT JOIN public.company_users sent_cu ON sent_cu.id = fl.sent_by
   WHERE fl.company_id = v_company_id
     AND EXISTS (
       SELECT 1
