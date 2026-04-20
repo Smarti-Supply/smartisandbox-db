@@ -128,7 +128,9 @@ function createTimelineEvents(
   for (const log of orderChangeLogs) {
     const createdAt = log.created_at as string | undefined;
     const formattedCreatedAt = log.formatted_created_at as string | undefined;
-    const changeDescription = log.change_description as string | undefined;
+    let changeDescription = log.change_description as string | undefined;
+    const numeroItem = log.item_number as number | undefined;
+
     if (!changeDescription) continue;
     // Não exibir alterações genéricas sem detalhe
     if (
@@ -141,6 +143,14 @@ function createTimelineEvents(
     if (/de\s+"N\/A"\s+para\s+"/i.test(changeDescription)) {
       continue;
     }
+
+    if (numeroItem != null) {
+      changeDescription = changeDescription.replace(
+        /^Status do item alterado de/i,
+        `Status do item ${numeroItem} alterado de`
+      );
+    }
+
     const userFormatted = formatUser(
       log.changed_by_name as string,
       log.changed_by_email as string
