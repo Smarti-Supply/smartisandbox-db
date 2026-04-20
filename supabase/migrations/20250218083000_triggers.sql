@@ -535,6 +535,61 @@ AFTER UPDATE ON public.order_items
 FOR EACH ROW
 EXECUTE FUNCTION private.fn_propagate_item_update_to_order();
 
+-- When every order line has the same pending item status (id = 1 in seed / default_order_status "criado"),
+-- align the parent order to the matching default order status.
+-- Interactions: updating orders runs trigger_sync_order_items_status (fn_sync_order_items_status), which
+-- may UPDATE order_items again; idempotent when items already match. trg_update_order_status_on_invoice
+-- may have set orders to 4/5; if all items return to status id 1, this still sets the order to 1.
+CREATE OR REPLACE FUNCTION private.fn_sync_order_status_when_all_items_status_one()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path TO 'public'
+AS $$
+DECLARE
+  v_order_id BIGINT;
+  -- Stable ids from seed (default_order_status, order_item_status); keep in sync if seeds change.
+  v_item_status_pending_confirmation_id BIGINT := 1;
+  v_order_status_pending_confirmation_id BIGINT := 1;
+  has_order_items BOOLEAN;
+  is_every_item_at_pending_status BOOLEAN;
+BEGIN
+  v_order_id := COALESCE(NEW.order_id, OLD.order_id);
+
+  SELECT EXISTS (
+    SELECT 1
+    FROM public.order_items oi
+    WHERE oi.order_id = v_order_id
+  )
+  INTO has_order_items;
+
+  SELECT has_order_items
+    AND NOT EXISTS (
+      SELECT 1
+      FROM public.order_items oi
+      WHERE oi.order_id = v_order_id
+        AND oi.status_id IS DISTINCT FROM v_item_status_pending_confirmation_id
+    )
+  INTO is_every_item_at_pending_status;
+
+  IF is_every_item_at_pending_status THEN
+    UPDATE public.orders o
+    SET
+      status_id = v_order_status_pending_confirmation_id,
+      updated_at = now()
+    WHERE o.id = v_order_id
+      AND o.status_id IS DISTINCT FROM v_order_status_pending_confirmation_id;
+  END IF;
+
+  RETURN COALESCE(NEW, OLD);
+END;
+$$;
+
+CREATE TRIGGER trg_sync_order_status_when_all_items_status_one
+AFTER INSERT OR UPDATE OR DELETE ON public.order_items
+FOR EACH ROW
+EXECUTE FUNCTION private.fn_sync_order_status_when_all_items_status_one();
+
 
 -- Função para atualizar o status do pedido (Entrega Parcial ou Concluido) com base nos invoices de itens
 CREATE OR REPLACE FUNCTION private.fn_update_order_status_on_invoice()
