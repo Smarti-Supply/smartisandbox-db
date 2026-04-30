@@ -1,1867 +1,689 @@
 -- ╭────────────────────────────────────────────────────────────────────╮
--- ┃                              RLS                                   ┃
+-- ┃                            Views                                   ┃
 -- ╰────────────────────────────────────────────────────────────────────╯
 
--- Habilitar RLS para as tabelas
-ALTER TABLE public.user_roles ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.company_plans ENABLE ROW LEVEL SECURITY;
-ALTER TABLE private.super_admins ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.companies ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.company_users ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.suppliers ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.supplier_contacts ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.supplier_users ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.order_item_status ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.default_order_status ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.orders ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.order_items ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.order_and_item_observations ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.order_item_invoices ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.order_logs ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.order_item_logs ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.order_notifications ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.followup_settings ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.followup_suppliers ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.followup_logs ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.company_invoices ENABLE ROW LEVEL SECURITY;
-ALTER TABLE public.import_field_mappings ENABLE ROW LEVEL SECURITY;
-ALTER TABLE private.process_logs ENABLE ROW LEVEL SECURITY;
-ALTER TABLE private.user_access_cache ENABLE ROW LEVEL SECURITY;
-ALTER TABLE private.followup_queue ENABLE ROW LEVEL SECURITY;
-ALTER TABLE private.followup_item_tracking ENABLE ROW LEVEL SECURITY;
-
--- Criar politicas de RLS
-
--- Política de acesso para tabela de super admins
-CREATE POLICY allow_authenticated_to_check_if_super_admin
-ON private.super_admins
-FOR SELECT
-TO authenticated
-USING (true);
-
-GRANT SELECT ON private.super_admins TO authenticated;
-
--- Política de acesso para tabela de UAC
-CREATE POLICY user_can_read_own_access_cache
-ON private.user_access_cache
-FOR SELECT 
-TO authenticated
-USING (auth.uid() = user_id AND is_active);
-
-GRANT SELECT ON private.user_access_cache TO authenticated;
-
--- Política de acesso para tabela de logs de processos
-CREATE POLICY user_can_see_own_logs
-ON private.process_logs
-FOR SELECT
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.role_name IN ('admin', 'comprador')
-      AND uac.is_active = true
-  )
-);
-
-GRANT SELECT ON private.process_logs TO authenticated;
-
--- Política de acesso para tabela de followup queue
-CREATE POLICY user_can_see_followup_queue
-ON private.followup_queue
-FOR SELECT
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.role_name IN ('admin', 'comprador')
-      AND uac.is_active = true
-  )
-);
-
-GRANT SELECT ON private.followup_queue TO authenticated;
-
--- Política de acesso para tabela de followup item tracking
-CREATE POLICY user_can_see_followup_item_tracking
-ON private.followup_item_tracking
-FOR SELECT
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.role_name IN ('admin', 'comprador')
-      AND uac.is_active = true
-  )
-);
-
-GRANT SELECT ON private.followup_item_tracking TO authenticated;
-
-
--- Política de acesso para tabela de funções de clientes
-CREATE POLICY users_can_read_user_roles
-ON public.user_roles
-FOR SELECT
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.is_active = true
-  )
-);
-
-CREATE POLICY superadmins_can_manage_user_roles
-ON public.user_roles
-FOR ALL
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1 FROM private.super_admins sa
-    WHERE sa.id = (select auth.uid())
-  )
+-- Criar view para listar os dados de uso dos planos
+CREATE OR REPLACE VIEW public.view_client_usage
+WITH (security_invoker = true)
+AS
+SELECT
+    u.company_id,
+    c.plan_id,
+    DATE_TRUNC('month', NOW())::DATE AS period_start,
+    (DATE_TRUNC('month', NOW()) + INTERVAL '1 month' - INTERVAL '1 day')::DATE AS period_end,
+    COUNT(DISTINCT oi.id) AS total_order_lines,
+    COALESCE(SUM(
+    CASE 
+        WHEN fl.supplier_contacts IS NOT NULL 
+        THEN cardinality(fl.supplier_contacts)
+        ELSE 0
+    END
+    ), 0) AS total_emails_sent
+FROM public.company_users u
+JOIN public.companies c ON c.id = u.company_id
+LEFT JOIN public.orders o 
+ON o.company_id = u.company_id
+AND o.created_at >= DATE_TRUNC('month', NOW())
+AND o.created_at < (DATE_TRUNC('month', NOW()) + INTERVAL '1 month')
+LEFT JOIN public.order_items oi 
+ON oi.order_id = o.id
+AND oi.created_at >= DATE_TRUNC('month', NOW())
+AND oi.created_at < (DATE_TRUNC('month', NOW()) + INTERVAL '1 month')
+LEFT JOIN public.followup_logs fl 
+ON fl.company_id = u.company_id
+AND fl.sent_at >= DATE_TRUNC('month', NOW())
+AND fl.sent_at < (DATE_TRUNC('month', NOW()) + INTERVAL '1 month')
+WHERE EXISTS (
+SELECT 1
+FROM private.user_access_cache uac
+WHERE uac.user_id = (select auth.uid())
+    AND uac.role_name = 'admin'
+    AND uac.is_active = true
+    AND uac.company_id = u.company_id
 )
-WITH CHECK (
-  EXISTS (
-    SELECT 1 FROM private.super_admins sa
-    WHERE sa.id = (select auth.uid())
-  )
-);
+GROUP BY u.company_id, c.plan_id;
 
--- Política de acesso para tabela de planos de clientes
-CREATE POLICY client_admins_can_read_active_plans
-ON public.company_plans
-FOR SELECT
-TO authenticated
-USING (
-  is_active = TRUE
-  AND EXISTS (
+
+-- Criar view para listar os pedidos dos clientes
+CREATE OR REPLACE VIEW public.view_orders
+WITH (security_invoker = true)
+AS
+SELECT
+o.id,
+o.order_number,
+o.order_description,
+s.external_id,
+s.name AS supplier_name,
+o.due_date,
+dos.id AS status_id,
+dos.name AS status_name,
+o.created_at,
+o.updated_at,
+CASE
+  WHEN dos.is_final = TRUE AND dos.code != 'concluido' THEN false
+  WHEN NOT EXISTS (
+    SELECT 1 FROM public.order_items oi
+    JOIN public.order_item_status ois ON oi.status_id = ois.id
+    WHERE oi.order_id = o.id AND ois.is_final = FALSE
+  ) THEN false  -- Se todos os itens são finais, nunca é atrasado
+  WHEN EXISTS (
+    SELECT 1 FROM public.order_items oi
+    JOIN public.order_item_status ois ON oi.status_id = ois.id
+    WHERE oi.order_id = o.id AND ois.is_final = FALSE
+  ) AND dos.code = 'concluido' THEN true  -- Concluído com itens não finais é atrasado
+  ELSE CURRENT_DATE > o.due_date
+END AS overdue_order,
+-- Notificações do fornecedor (para compradores verem)
+EXISTS (
     SELECT 1
-    FROM private.user_access_cache uac
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.role_name = 'admin'
-      AND uac.is_active = TRUE
-  )
-);
+    FROM public.order_notifications orn
+    WHERE orn.order_id = o.id
+      AND orn.is_read = false
+      AND orn.type IN ('order_status_change', 'delivery_date_change', 'item_status_change', 'item_invoiced')
+) AS has_notifications_from_supplier,
 
-CREATE POLICY superadmins_can_read_all_plans
-ON public.company_plans
-FOR SELECT
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1 FROM private.super_admins sa
-    WHERE sa.id = (select auth.uid())
-  )
-);
-
-
--- Política de acesso para tabela de empresas
-CREATE POLICY company_users_can_read_own_company
-ON public.companies
-FOR SELECT
-TO authenticated
-USING (
-  EXISTS (
+-- Notificações do comprador (para fornecedores verem)
+EXISTS (
     SELECT 1
-    FROM private.user_access_cache uac
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.is_active = TRUE
-      AND uac.role_name IN ('admin', 'comprador')
-      AND uac.company_id = companies.id
-  )
-);
+    FROM public.order_notifications orn
+    WHERE orn.order_id = o.id
+      AND orn.is_read = false
+      AND orn.type IN ('client_observation', 'client_status_change', 'client_item_change')
+) AS has_notifications_from_client,
 
-CREATE POLICY client_admin_can_insert_company
-ON public.companies
-FOR INSERT
-TO authenticated
-WITH CHECK (
-  EXISTS (
+-- Flag: existe pelo menos uma notificação não lida? (compatibilidade)
+EXISTS (
     SELECT 1
-    FROM private.user_access_cache uac
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.role_name = 'admin'
-      AND uac.is_active = true
-  )
-  AND NOT EXISTS (
+    FROM public.order_notifications orn
+    WHERE orn.order_id = o.id
+    AND orn.is_read = false
+) AS has_notifications,
+-- Adiciona o status_id com menor position dos order_items
+COALESCE(min_status.status_id, NULL) AS order_items_min_status_id,
+COALESCE(min_status.status_name, NULL) AS order_items_min_status_name
+FROM public.orders o
+JOIN public.suppliers s ON s.id = o.supplier_id
+JOIN public.default_order_status dos ON dos.id = o.status_id
+LEFT JOIN LATERAL (
+  SELECT 
+    oi.status_id,
+    ois.name AS status_name
+  FROM public.order_items oi
+  LEFT JOIN public.order_item_status ois ON oi.status_id = ois.id
+  WHERE oi.order_id = o.id
+    AND oi.status_id IS NOT NULL
+  ORDER BY COALESCE(ois.position, 999999) ASC
+  LIMIT 1
+) min_status ON true
+LIMIT 1000;
+
+/* 
+- Esta view foi customizada para a Transpetro e por conter campos que estão na migration customizada, este bloco será comentado para não gerar erros ao rodar a migration.
+- Para quaisquer outros clientes, favor remover este comentário e ajustar a view conforme necessário.
+
+-- Criar view para listar os itens dos pedidos dos clientes
+CREATE OR REPLACE VIEW public.view_order_items 
+WITH (security_invoker = true) AS 
+SELECT
+    oi.id,
+    oi.order_id,
+    oi.item_number,
+    oi.product,
+    oi.product_description,
+    oi.quantity,
+    oi.unity_of_measure,
+    oi.unit_price,
+    oi.total_price,
+    oi.plant,
+    oi.due_date,
+    oi.current_delivery_date,
+    oi.deliver_time,
+    ois.id AS status_id,
+    ois.name AS status_name,
+    -- Soma das quantidades faturadas para este item
+    COALESCE(
+        (SELECT SUM(oii.quantity) 
+        FROM public.order_item_invoices oii 
+        WHERE oii.order_item_id = oi.id),
+        0
+    ) AS invoiced_quantity,
+
+    -- Notificação mais recente não lida (se houver)
+    n.type AS notification_type,
+    n.message AS notification_message,
+
+    -- Flag: existe pelo menos uma notificação não lida?
+    EXISTS (
     SELECT 1
-    FROM public.companies c
-    WHERE c.created_by = (select auth.uid())
-  )
-  AND NOT EXISTS (
-    SELECT 1
-    FROM public.company_users cu
-    WHERE cu.id = (select auth.uid()) AND cu.company_id IS NOT NULL
-  )
-);
+    FROM public.order_notifications
+    WHERE order_item_id = oi.id
+        AND is_read = false
+    ) AS has_unread_notification
 
-CREATE POLICY client_admin_can_update_own_company
-ON public.companies
-FOR UPDATE
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.role_name = 'admin'
-      AND uac.is_active = true
-      AND uac.company_id = companies.id
-  )
-)
-WITH CHECK (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.role_name = 'admin'
-      AND uac.is_active = true
-      AND uac.company_id = companies.id
-  )
-);
+FROM public.order_items oi
+LEFT JOIN public.order_item_status ois ON oi.status_id = ois.id
+LEFT JOIN LATERAL (
+    SELECT type, message, is_read
+    FROM public.order_notifications
+    WHERE order_item_id = oi.id
+    AND is_read = false
+    ORDER BY created_at DESC
+    LIMIT 1
+) n ON true;
+*/
 
-CREATE POLICY client_admin_cant_delete_own_company
-ON public.companies
-FOR DELETE
-TO authenticated
-USING (FALSE); -- Bloqueia deleção por clientes
-
-CREATE POLICY superadmins_can_manage_all_companies
-ON public.companies
-FOR ALL
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1 FROM private.super_admins sa
-    WHERE sa.id = (select auth.uid())
-  )
-)
-WITH CHECK (
-  EXISTS (
-    SELECT 1 FROM private.super_admins sa
-    WHERE sa.id = (select auth.uid())
-  )
-);
-
--- Política de acesso para tabela de usuários de empresas
-CREATE POLICY client_admins_and_buyers_can_read_own_company_users
-ON public.company_users
-FOR SELECT
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.role_name IN ('admin', 'comprador')
-      AND uac.is_active = true
-      AND uac.company_id = company_users.company_id
-  )
-);
-
-CREATE POLICY client_admin_can_insert_users
-ON public.company_users
-FOR INSERT
-TO authenticated
-WITH CHECK (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.role_name = 'admin'
-      AND uac.is_active = true
-      AND uac.company_id = company_users.company_id
-  )
-);
-
-CREATE POLICY client_admin_can_update_own_company_users
-ON public.company_users
-FOR UPDATE
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.role_name = 'admin'
-      AND uac.is_active = true
-      AND uac.company_id = company_users.company_id
-  )
-)
-WITH CHECK (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.role_name = 'admin'
-      AND uac.is_active = true
-      AND uac.company_id = company_users.company_id
-  )
-);
+-- View de notificações dos pedidos (inline: permite predicate pushdown e índices;
+-- evita set-returning function que materializava toda a tabela por chamada).
+-- RLS: joins em company_users / supplier_users / supplier_contacts respeitam o invoker.
+CREATE OR REPLACE VIEW public.view_order_notifications
+WITH (security_invoker = true) AS
+SELECT
+    onf.id,
+    onf.order_id,
+    onf.order_item_id,
+    onf.type,
+    onf.message,
+    onf.is_read,
+    onf.created_at,
+    onf.read_by,
+    COALESCE(cu.name, sc.name) AS read_by_name,
+    COALESCE(cu.email, sc.email) AS read_by_email,
+    CASE
+        WHEN cu.id IS NOT NULL THEN 'client'::TEXT
+        WHEN su.id IS NOT NULL THEN 'supplier'::TEXT
+        ELSE NULL::TEXT
+    END AS read_by_user_type,
+    CASE
+        WHEN onf.type IN (
+            'client_observation',
+            'client_status_change',
+            'client_item_change'
+        ) THEN true
+        ELSE false
+    END AS is_from_client,
+    o.supplier_id
+FROM public.order_notifications onf
+LEFT JOIN public.orders o ON o.id = onf.order_id
+LEFT JOIN public.company_users cu ON cu.id = onf.read_by
+LEFT JOIN public.supplier_users su ON su.id = onf.read_by
+LEFT JOIN public.supplier_contacts sc ON sc.id = su.supplier_contact_id;
 
 
-CREATE POLICY client_admin_can_delete_own_company_users
-ON public.company_users
-FOR DELETE
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.role_name = 'admin'
-      AND uac.is_active = true
-      AND uac.company_id = company_users.company_id
-  )
-);
+-- Criar view para listar os registros de processo realizados por usuários
+CREATE OR REPLACE VIEW public.view_user_process_logs
+WITH (security_invoker = true) AS
+SELECT
+pl.id,
+pl.process_name,
+pl.function_name,
+pl.step,
+pl.status,
+pl.message,
+pl.user_id,
+pl.order_id,
+pl.metadata,
+pl.created_at,
+CASE pl.process_name
+    WHEN 'orders_upload'              THEN 'Importação de Pedidos'
+    WHEN 'suppliers_upload'           THEN 'Importação de Fornecedores'
+    WHEN 'send_followup_emails'       THEN 'Envio de Follow-ups'
+    WHEN 'send_followup_emails_cron'  THEN 'Envio de Follow-ups Automatizado'
+    WHEN 'send_order_cancel_emails'   THEN 'Envio de Cancelamento de Pedidos'
+    WHEN 'create_new_user'            THEN 'Criação de Novo Usuário'
+    WHEN 'delete_inactive_auth_users' THEN 'Limpeza de Usuários Inativos'
+    ELSE pl.process_name
+END AS process_label,
+CASE pl.status
+    WHEN 'success' THEN 'Sucesso'
+    WHEN 'error'   THEN 'Erro'
+    WHEN 'warning' THEN 'Alerta'
+    WHEN 'info'    THEN 'Informação'
+    WHEN 'skip'    THEN 'Ignorado'
+    ELSE pl.status
+END AS status_label,
+cu.name  AS user_name,
+cu.email AS user_email,
+o.order_number,
+o.order_description
+FROM private.process_logs pl
+LEFT JOIN public.company_users cu ON cu.id = pl.user_id
+LEFT JOIN public.orders o ON o.id = pl.order_id;
 
-CREATE POLICY superadmins_can_manage_all_company_users
-ON public.company_users
-FOR ALL
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1 FROM private.super_admins sa
-    WHERE sa.id = (select auth.uid())
-  )
-)
-WITH CHECK (
-  EXISTS (
-    SELECT 1 FROM private.super_admins sa
-    WHERE sa.id = (select auth.uid())
-  )
-);
 
--- Política de acesso para tabela de usuários de fornecedores
-CREATE POLICY client_admins_can_read_own_supplier_users
-ON public.supplier_users
-FOR SELECT
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    JOIN public.supplier_contacts sc ON sc.id = supplier_users.supplier_contact_id
-    JOIN public.suppliers s ON sc.supplier_id = s.id
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.role_name = 'admin'
-      AND uac.is_active = true
-      AND s.company_id = uac.company_id
-  )
-);
+-- Criar view para listar os fornecedores
+CREATE VIEW public.view_suppliers
+WITH (security_invoker = true)
+AS
+SELECT
+    s.id,
+    s.company_id,
+    s.external_id,
+    s.name,
+    s.cnpj,
+    s.industry,
+    s.products_services,
+    s.website,
+    s.description,
+    s.address_street,
+    s.address_number,
+    s.address_neighborhood,
+    s.address_city,
+    s.address_state,
+    s.address_country,
+    s.address_zipcode,
+    s.address_complement,
+    cu.name AS creator_name,
+    s.created_at
+FROM public.suppliers s
+LEFT JOIN public.company_users cu ON s.created_by = cu.id
+LIMIT 1000;
 
-CREATE POLICY client_buyers_can_read_own_supplier_users
-ON public.supplier_users
-FOR SELECT
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    JOIN public.supplier_contacts sc ON sc.id = supplier_users.supplier_contact_id
-    JOIN public.suppliers s ON sc.supplier_id = s.id
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.role_name = 'comprador'
-      AND uac.is_active = true
-      AND s.company_id = uac.company_id
-  )
-);
 
-CREATE POLICY client_admins_can_insert_supplier_users
-ON public.supplier_users
-FOR INSERT
-TO authenticated
-WITH CHECK (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    JOIN public.supplier_contacts sc ON sc.id = supplier_users.supplier_contact_id
-    JOIN public.suppliers s ON s.id = sc.supplier_id
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.role_name = 'admin'
-      AND uac.is_active = true
-      AND s.company_id = uac.company_id
-  )
-);
+-- Criar view para listar os usuários dos fornecedores
+CREATE OR REPLACE VIEW public.view_supplier_contacts
+WITH (security_invoker = true)
+AS
+SELECT
+    sc.id AS supplier_contact_id,
+    sc.supplier_id,
+    sc.name,
+    sc.email,
+    sc.phone,
+    cu.name AS creator_name,
+    sc.created_at,
+    sc.is_active,
+    -- Dados do usuário (se existir)
+    su.id AS auth_user_id,
+    su.role_id,
+    su.last_login
+FROM public.supplier_contacts sc
+LEFT JOIN public.company_users cu ON sc.created_by = cu.id
+LEFT JOIN public.supplier_users su ON su.supplier_contact_id = sc.id;
 
-CREATE POLICY client_admin_can_update_own_supplier_users
-ON public.supplier_users
-FOR UPDATE
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    JOIN public.supplier_contacts sc ON sc.id = supplier_users.supplier_contact_id
-    JOIN public.suppliers s ON sc.supplier_id = s.id
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.role_name = 'admin'
-      AND uac.is_active = true
-      AND s.company_id = uac.company_id
-  )
-)
-WITH CHECK (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    JOIN public.supplier_contacts sc ON sc.id = supplier_users.supplier_contact_id
-    JOIN public.suppliers s ON sc.supplier_id = s.id
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.role_name = 'admin'
-      AND uac.is_active = true
-      AND s.company_id = uac.company_id
-  )
-);
 
-CREATE POLICY client_admin_can_delete_own_supplier_users
-ON public.supplier_users
-FOR DELETE
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    JOIN public.supplier_contacts sc ON sc.id = supplier_users.supplier_contact_id
-    JOIN public.suppliers s ON sc.supplier_id = s.id
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.role_name = 'admin'
-      AND uac.is_active = true
-      AND s.company_id = uac.company_id
-  )
-);
+-- Criar view para exibir as empresas do cliente
+CREATE OR REPLACE VIEW public.view_companies
+WITH (security_invoker = true)
+AS
+SELECT
+    c.id,
+    c.name,
+    c.cnpj,
+    c.address_street,
+    c.address_number,
+    c.address_neighborhood,
+    c.address_city,
+    c.address_state,
+    c.address_zipcode,
+    c.address_complement,
+    c.plan_id,
+    cu.name AS created_by,
+    c.created_at
+FROM public.companies c
+LEFT JOIN public.company_users cu ON c.created_by = cu.id;
 
-CREATE POLICY superadmins_can_manage_all_supplier_users
-ON public.supplier_users
-FOR ALL
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1 FROM private.super_admins sa
-    WHERE sa.id = (select auth.uid())
-  )
-)
-WITH CHECK (
-  EXISTS (
-    SELECT 1 FROM private.super_admins sa
-    WHERE sa.id = (select auth.uid())
-  )
-);
 
--- Política de acesso para tabela de fornecedores
-CREATE POLICY company_or_supplier_can_read_own_suppliers
-ON public.suppliers
-FOR SELECT
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.is_active = true
-      AND (
-        (
-          uac.role_name IN ('admin', 'comprador')
-          AND suppliers.company_id = uac.company_id
-        )
-        OR (
-          uac.role_name = 'fornecedor'
-          AND suppliers.id = uac.supplier_id
-        )
-      )
-  )
-);
+-- Criar view para listar os usuários do sistema
+CREATE OR REPLACE VIEW public.view_company_users
+WITH (security_invoker = true)
+AS
+SELECT
+    cu.id,
+    cu.company_id,
+    cu.name,
+    cu.email,
+    cu.phone,
+    cu.role_id,
+    ur.name AS role_name,
+    cu.is_active,
+    cu.created_at,
+    cu.last_login,
+    cu.created_by,
+    creator.name AS creator_name  -- Substitui o UUID por nome
+FROM public.company_users cu
+LEFT JOIN public.company_users creator ON creator.id = cu.created_by
+LEFT JOIN public.user_roles ur ON ur.id = cu.role_id;
 
-CREATE POLICY admin_can_insert_supplier
-ON public.suppliers
-FOR INSERT
-TO authenticated
-WITH CHECK (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.role_name = 'admin'
-      AND uac.is_active = true
-      AND uac.company_id = suppliers.company_id
-  )
-);
 
-CREATE POLICY admin_can_update_supplier
-ON public.suppliers
-FOR UPDATE
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.role_name = 'admin'
-      AND uac.is_active = true
-      AND uac.company_id = suppliers.company_id
-  )
-)
-WITH CHECK (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.role_name = 'admin'
-      AND uac.is_active = true
-      AND uac.company_id = suppliers.company_id
-  )
-);
+-- Criar view para utilizar como tabela de roles para o weweb
+CREATE OR REPLACE VIEW public.view_user_access_cache
+WITH (security_invoker = true)
+AS
+SELECT
+user_id AS id,
+role_id,
+role_name,
+company_id,
+supplier_id,
+is_active,
+last_synced_at
+FROM private.user_access_cache;
 
-CREATE POLICY admin_can_delete_supplier
-ON public.suppliers
-FOR DELETE
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.role_name = 'admin'
-      AND uac.is_active = true
-      AND uac.company_id = suppliers.company_id
-  )
-);
 
-CREATE POLICY superadmins_can_manage_all_suppliers
-ON public.suppliers
-FOR ALL
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1 FROM private.super_admins sa
-    WHERE sa.id = (select auth.uid())
-  )
-)
-WITH CHECK (
-  EXISTS (
-    SELECT 1 FROM private.super_admins sa
-    WHERE sa.id = (select auth.uid())
-  )
-);
+-- Criar view para Acompanhar performance e identificar problemas: Status geral da fila
+CREATE OR REPLACE VIEW public.view_followup_queue_status
+WITH (security_invoker = true)
+AS
+SELECT 
+    status,
+    COUNT(*) as total,
+    MIN(created_at) as oldest,
+    MAX(created_at) as newest
+FROM private.followup_queue
+GROUP BY status;
 
--- Política de acesso para tabela de usuários de fornecedores
-CREATE POLICY company_users_can_read_supplier_contacts
-ON public.supplier_contacts
-FOR SELECT
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    JOIN public.suppliers s ON s.id = supplier_contacts.supplier_id
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.role_name IN ('admin', 'comprador')
-      AND uac.is_active = true
-      AND s.company_id = uac.company_id
-  )
-);
 
-CREATE POLICY company_admin_can_insert_supplier_contacts
-ON public.supplier_contacts
-FOR INSERT
-TO authenticated
-WITH CHECK (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    JOIN public.suppliers s ON s.id = supplier_contacts.supplier_id
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.role_name = 'admin'
-      AND uac.is_active = true
-      AND s.company_id = uac.company_id
-  )
-);
+-- Criar view para Acompanhar performance e identificar problemas: Performance por empresa
+CREATE OR REPLACE VIEW public.view_followup_performance
+WITH (security_invoker = true)
+AS
+SELECT 
+    c.name as company_name,
+    fq.status,
+    COUNT(*) as total,
+    AVG(fq.tentativa) as avg_attempts,
+    MAX(fq.updated_at) as last_activity
+FROM private.followup_queue fq
+JOIN public.companies c ON c.id = fq.company_id
+WHERE fq.created_at > NOW() - INTERVAL '7 days'
+GROUP BY c.name, fq.status
+ORDER BY c.name, fq.status;
 
-CREATE POLICY company_admin_can_update_supplier_contacts
-ON public.supplier_contacts
-FOR UPDATE
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    JOIN public.suppliers s ON s.id = supplier_contacts.supplier_id
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.role_name = 'admin'
-      AND uac.is_active = true
-      AND s.company_id = uac.company_id
-  )
-)
-WITH CHECK (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    JOIN public.suppliers s ON s.id = supplier_contacts.supplier_id
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.role_name = 'admin'
-      AND uac.is_active = true
-      AND s.company_id = uac.company_id
-  )
-);
 
-CREATE POLICY company_admin_can_delete_supplier_contacts
-ON public.supplier_contacts
-FOR DELETE
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    JOIN public.suppliers s ON s.id = supplier_contacts.supplier_id
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.role_name = 'admin'
-      AND uac.is_active = true
-      AND s.company_id = uac.company_id
-  )
-);
+-- Criar view para Acompanhar performance e identificar problemas: Regras mais ativas
+CREATE OR REPLACE VIEW public.view_followup_rules_activity
+WITH (security_invoker = true)
+AS
+SELECT 
+    fs.rule_name,
+    fs.trigger_scope,
+    c.name as company_name,
+    COUNT(fq.id) as queue_items,
+    fs.last_sent_at,
+    fs.send_days_interval
+FROM public.followup_settings fs
+JOIN public.companies c ON c.id = fs.company_id
+LEFT JOIN private.followup_queue fq ON fq.setting_id = fs.id
+WHERE fs.is_active = true
+GROUP BY fs.id, fs.rule_name, fs.trigger_scope, c.name, fs.last_sent_at, fs.send_days_interval
+ORDER BY queue_items DESC;
 
-CREATE POLICY superadmins_can_manage_all_supplier_contacts
-ON public.supplier_contacts
-FOR ALL
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1 FROM private.super_admins sa
-    WHERE sa.id = (select auth.uid())
-  )
-)
-WITH CHECK (
-  EXISTS (
-    SELECT 1 FROM private.super_admins sa
-    WHERE sa.id = (select auth.uid())
-  )
-);
 
--- Política de acesso para tabela de status de pedidos
-CREATE POLICY company_or_supplier_can_read_order_item_status
-ON public.order_item_status
-FOR SELECT
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.is_active = true
-      AND (
-        -- Acesso direto por admin ou comprador da empresa
-        (uac.role_name IN ('admin', 'comprador') AND uac.company_id = order_item_status.company_id)
+-- Criar view para visualizar status personalizados com o nome do status global
+CREATE OR REPLACE VIEW public.view_order_item_status
+WITH (security_invoker = true)
+AS
+SELECT
+    ois.id,
+    ois.company_id,
+    ois.name,
+    ois.color,
+    ois.position,
+    ois.is_final,
+    ois.expose_to_supplier,
+    ois.default_status_id,
+    dos.name AS default_status_name,  -- Nome do status global ao invés do ID
+    ois.created_at
+FROM public.order_item_status ois
+LEFT JOIN public.default_order_status dos ON ois.default_status_id = dos.id;
 
-        -- Acesso por fornecedor se o status for visível e ele atender essa empresa
-        OR (
-          uac.role_name = 'fornecedor'
-          AND uac.company_id = order_item_status.company_id
-          AND order_item_status.expose_to_supplier = true
-        )
-      )
-  )
-);
 
-CREATE POLICY company_admin_can_insert_order_item_status
-ON public.order_item_status
-FOR INSERT
-TO authenticated
-WITH CHECK (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.role_name = 'admin'
-      AND uac.is_active = true
-      AND uac.company_id = order_item_status.company_id
-  )
-);
+-- Criar view para visualizar configurações de follow-up com descrição do trigger scope
+CREATE OR REPLACE VIEW public.view_followup_settings
+WITH (security_invoker = true)
+AS
+SELECT
+    fs.id,
+    fs.company_id,
+    fs.rule_name,
+    fs.last_sent_at,
+    fs.trigger_scope,
+    -- Campo extra que traduz o trigger_scope para um nome descritivo
+    CASE 
+        WHEN fs.trigger_scope = 'default_order_status' THEN 'Status de Pedido'
+        WHEN fs.trigger_scope = 'order_due_date' THEN 'Data de Vencimento do Pedido'
+        WHEN fs.trigger_scope = 'item_status' THEN 'Status'
+        WHEN fs.trigger_scope = 'item_due_date' THEN 'Data de Vencimento do Item'
+        WHEN fs.trigger_scope = 'item_delivery_date' THEN 'Data de Entrega do Item'
+        WHEN fs.trigger_scope = 'manual_user_trigger' THEN 'Trigger Manual do Usuário'
+        WHEN fs.trigger_scope = 'manual_user_order_cancel' THEN 'Cancelamento Manual do Pedido'
+        ELSE fs.trigger_scope
+    END AS trigger_scope_description,
+    fs.trigger_reference_id,
+    -- Novo campo: busca o nome do status baseado no trigger_scope
+    CASE 
+        WHEN fs.trigger_scope IN ('default_order_status') THEN
+            (SELECT dos.name FROM public.default_order_status dos WHERE dos.id = fs.trigger_reference_id)
+        WHEN fs.trigger_scope IN ('item_status') THEN
+            (SELECT ois.name FROM public.order_item_status ois WHERE ois.id = fs.trigger_reference_id)
+        ELSE NULL
+    END AS trigger_reference_name,
+    fs.send_days_interval,
+    fs.repeat_interval_days,
+    fs.max_followups,
+    fs.cooldown_per_order,
+    fs.email_template,
+    fs.notification_type,
+    fs.is_active,
+    fs.created_at
+FROM public.followup_settings fs
+WHERE fs.is_system_config = false;
 
-CREATE POLICY company_admin_can_update_own_order_item_status
-ON public.order_item_status
-FOR UPDATE
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.role_name = 'admin'
-      AND uac.is_active = true
-      AND uac.company_id = order_item_status.company_id
-  )
-)
-WITH CHECK (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.role_name = 'admin'
-      AND uac.is_active = true
-      AND uac.company_id = order_item_status.company_id
-  )
-);
 
-CREATE POLICY company_admin_can_delete_own_order_item_status
-ON public.order_item_status
-FOR DELETE
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.role_name = 'admin'
-      AND uac.is_active = true
-      AND uac.company_id = order_item_status.company_id
-  )
-);
+-- Criar view para visualizar observações da order e item com item_number
+CREATE OR REPLACE VIEW public.view_order_and_item_observations
+WITH (security_invoker = true)
+AS
+SELECT 
+    oio.id,
+    oio.order_id,
+    oio.order_item_id,
+    o.order_number,
+    oi.item_number,
+    oi.product,
+    oio.user_observations,
+    oio.supplier_observations,
+    oio.current_delivery_date,
+    oio.created_at,
+    oio.created_by
+FROM public.order_and_item_observations oio
+LEFT JOIN public.order_items oi ON oio.order_item_id = oi.id
+LEFT JOIN public.orders o ON oio.order_id = o.id;
 
-CREATE POLICY superadmins_can_manage_all_order_item_status
-ON public.order_item_status
-FOR ALL
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1 FROM private.super_admins sa
-    WHERE sa.id = (select auth.uid())
-  )
-)
-WITH CHECK (
-  EXISTS (
-    SELECT 1 FROM private.super_admins sa
-    WHERE sa.id = (select auth.uid())
-  )
-);
 
--- Política de acesso para tabela de status padrão de pedidos
-CREATE POLICY allow_read_default_order_status
-ON public.default_order_status
-FOR SELECT
-TO authenticated
-USING (TRUE);
+-- Criar view que combina informações de itens de pedido e pedidos com suas respectivas faturas/notas fiscais
+CREATE VIEW public.view_order_and_item_invoices
+WITH (security_invoker = true) AS
+SELECT 
+    oi.order_id,
+    oi.id AS order_item_id,
+    oi.item_number,
+    oi.product,
+    oii.id AS invoice_id,
+    oii.nfe_number,
+    oii.invoiced_value,
+    oii.nfe_date,
+    oii.created_at,
+    oi.quantity AS quantity_ordered,    -- Quantidade solicitada do pedido
+    oii.quantity AS quantity_delivered  -- Quantidade entregue/faturada
+FROM 
+    public.order_items oi
+INNER JOIN 
+    public.order_item_invoices oii ON oi.id = oii.order_item_id
+ORDER BY 
+    oi.order_id, 
+    oi.item_number, 
+    oii.nfe_date;
 
--- Política de acesso para tabela de pedidos
-CREATE POLICY company_or_supplier_can_read_own_orders
-ON public.orders
-FOR SELECT
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.is_active = true
-      AND (
-        (uac.role_name IN ('admin', 'comprador') AND orders.company_id = uac.company_id)
-        OR (uac.role_name = 'fornecedor' AND orders.supplier_id = uac.supplier_id)
-      )
-  )
-);
 
-CREATE POLICY company_admin_can_insert_orders
-ON public.orders
-FOR INSERT
-TO authenticated
-WITH CHECK (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.role_name = 'admin'
-      AND uac.is_active = true
-      AND uac.company_id = orders.company_id
-  )
-);
-
-CREATE POLICY company_admin_can_update_own_orders
-ON public.orders
-FOR UPDATE
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.role_name IN ('admin', 'comprador')
-      AND uac.is_active = true
-      AND uac.company_id = orders.company_id
-  )
-)
-WITH CHECK (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.role_name IN ('admin', 'comprador')
-      AND uac.is_active = true
-      AND uac.company_id = orders.company_id
-  )
-);
-
-CREATE POLICY supplier_can_update_own_orders_status
-ON public.orders
-FOR UPDATE
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.role_name = 'fornecedor'
-      AND uac.is_active = true
-      AND orders.supplier_id = uac.supplier_id
-  )
-)
-WITH CHECK (
-  orders.status_id IS NOT NULL
-);
-
-CREATE POLICY company_admin_can_delete_own_orders
-ON public.orders
-FOR DELETE
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.role_name = 'admin'
-      AND uac.is_active = true
-      AND uac.company_id = orders.company_id
-  )
-);
-
-CREATE POLICY superadmins_can_manage_all_orders
-ON public.orders
-FOR ALL
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1 FROM private.super_admins sa
-    WHERE sa.id = (select auth.uid())
-  )
-)
-WITH CHECK (
-  EXISTS (
-    SELECT 1 FROM private.super_admins sa
-    WHERE sa.id = (select auth.uid())
-  )
-);
-
--- Política de acesso para tabela de itens de pedidos
-CREATE POLICY company_or_supplier_can_read_own_order_items
-ON public.order_items
-FOR SELECT
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    JOIN public.orders o ON o.id = order_items.order_id
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.is_active = true
-      AND (
-        (uac.role_name IN ('admin', 'comprador') AND o.company_id = uac.company_id)
-        OR (uac.role_name = 'fornecedor' AND o.supplier_id = uac.supplier_id)
-      )
-  )
-);
-
-CREATE POLICY company_admin_can_insert_order_items
-ON public.order_items
-FOR INSERT
-TO authenticated
-WITH CHECK (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    JOIN public.orders o ON o.id = order_items.order_id
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.role_name = 'admin'
-      AND uac.is_active = true
-      AND o.company_id = uac.company_id
-  )
-);
-
-CREATE POLICY company_users_can_update_own_order_items
-ON public.order_items
-FOR UPDATE
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    JOIN public.orders o ON o.id = order_items.order_id
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.is_active = true
-      AND uac.role_name IN ('admin', 'comprador')
-      AND o.company_id = uac.company_id
-  )
-)
-WITH CHECK (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    JOIN public.orders o ON o.id = order_items.order_id
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.is_active = true
-      AND uac.role_name IN ('admin', 'comprador')
-      AND o.company_id = uac.company_id
-  )
-);
-
-CREATE POLICY suppliers_restricted_updates_order_items
-ON public.order_items
-FOR UPDATE
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    JOIN public.orders o ON o.id = order_items.order_id
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.is_active = true
-      AND uac.role_name = 'fornecedor'
-      AND o.supplier_id = uac.supplier_id
-  )
-)
-WITH CHECK (
-  -- Só pode alterar current_delivery_date ou status_id
-  order_items.current_delivery_date IS NOT NULL
-  OR order_items.status_id IS NOT NULL
-);
-
-CREATE POLICY company_admin_can_delete_own_order_items
-ON public.order_items
-FOR DELETE
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    JOIN public.orders o ON o.id = order_items.order_id
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.role_name = 'admin'
-      AND uac.is_active = true
-      AND o.company_id = uac.company_id
-  )
-);
-
-CREATE POLICY superadmins_can_manage_all_order_items
-ON public.order_items
-FOR ALL
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1 FROM private.super_admins sa
-    WHERE sa.id = (select auth.uid())
-  )
-)
-WITH CHECK (
-  EXISTS (
-    SELECT 1 FROM private.super_admins sa
-    WHERE sa.id = (select auth.uid())
-  )
-);
-
--- Política de acesso para tabela de observações de itens de pedidos
-CREATE POLICY company_or_supplier_can_read_own_observations
-ON public.order_and_item_observations
-FOR SELECT
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    JOIN public.orders o ON o.id = order_and_item_observations.order_id
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.is_active = true
-      AND (
-        (uac.role_name IN ('admin', 'comprador') AND o.company_id = uac.company_id)
-        OR (uac.role_name = 'fornecedor' AND o.supplier_id = uac.supplier_id)
-      )
-  )
-);
-
-CREATE POLICY insert_by_company_users
-ON public.order_and_item_observations
-FOR INSERT
-TO authenticated
-WITH CHECK (
-  -- Vínculo com empresa e permissão
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    JOIN public.orders o ON o.id = order_and_item_observations.order_id
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.is_active
-      AND uac.role_name IN ('admin', 'comprador')
-      AND o.company_id = uac.company_id
-  )
-  -- Validar autoria
-  AND order_and_item_observations.created_by = (select auth.uid())
-  -- Só pode preencher observações de usuário
-  AND order_and_item_observations.user_observations IS NOT NULL
-  AND order_and_item_observations.supplier_observations IS NULL
-);
-
-CREATE POLICY insert_by_suppliers
-ON public.order_and_item_observations
-FOR INSERT
-TO authenticated
-WITH CHECK (
-  -- Vínculo com pedido e supplier_id
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    JOIN public.orders o ON o.id = order_and_item_observations.order_id
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.is_active
-      AND uac.role_name = 'fornecedor'
-      AND o.supplier_id = uac.supplier_id
-  )
-  -- Validar autoria
-  AND order_and_item_observations.created_by = (select auth.uid())
-  -- Só pode preencher observações de fornecedor
-  AND order_and_item_observations.supplier_observations IS NOT NULL
-  AND order_and_item_observations.user_observations IS NULL
-);
-
-CREATE POLICY update_user_observations_by_company_users
-ON public.order_and_item_observations
-FOR UPDATE
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    JOIN public.orders o ON o.id = order_and_item_observations.order_id
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.is_active = true
-      AND uac.role_name IN ('admin', 'comprador')
-      AND o.company_id = uac.company_id
-  )
-  AND order_and_item_observations.created_by = (select auth.uid())
-)
-WITH CHECK (
-  -- Permite modificar apenas a parte que eles podem
-  user_observations IS NOT NULL
-);
-
-CREATE POLICY update_supplier_observations_by_supplier
-ON public.order_and_item_observations
-FOR UPDATE
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    JOIN public.orders o ON o.id = order_and_item_observations.order_id
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.is_active = true
-      AND uac.role_name = 'fornecedor'
-      AND o.supplier_id = uac.supplier_id
-  )
-  AND order_and_item_observations.created_by = (select auth.uid())
-)
-WITH CHECK (
-  supplier_observations IS NOT NULL
-);
-
-CREATE POLICY company_admin_can_delete_observations
-ON public.order_and_item_observations
-FOR DELETE
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    JOIN public.orders o ON o.id = order_and_item_observations.order_id
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.role_name = 'admin'
-      AND uac.is_active = true
-      AND o.company_id = uac.company_id
-  )
-  OR created_by = (select auth.uid())
-);
-
-CREATE POLICY superadmins_can_manage_all_observations
-ON public.order_and_item_observations
-FOR ALL
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1 FROM private.super_admins sa
-    WHERE sa.id = (select auth.uid())
-  )
-)
-WITH CHECK (
-  EXISTS (
-    SELECT 1 FROM private.super_admins sa
-    WHERE sa.id = (select auth.uid())
-  )
-);
-
--- Política de acesso para tabela de faturas de itens de pedidos
-CREATE POLICY company_or_supplier_can_read_own_invoices
-ON public.order_item_invoices
-FOR SELECT
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    JOIN public.order_items oi ON oi.id = order_item_invoices.order_item_id
+-- Criar view inteligente para visualizar logs de alterações dos pedidos
+CREATE OR REPLACE VIEW public.view_order_change_logs
+WITH (security_invoker = true)
+AS
+WITH combined_logs AS (
+    -- Logs de pedidos
+    SELECT 
+        'order' AS log_type,
+        ol.id,
+        ol.order_id,
+        NULL AS order_item_id,
+        ol.changed_by_client,
+        ol.changed_by_supplier,
+        ol.source,
+        ol.created_at,
+        -- Informações do pedido
+        o.order_number,
+        o.order_description,
+        s.name AS supplier_name,
+        dos_old.name AS old_status_name,
+        dos_new.name AS new_status_name,
+        ol.old_due_date,
+        ol.new_due_date,
+        ol.old_order_number,
+        ol.new_order_number,
+        ol.old_order_description,
+        ol.new_order_description,
+        ol.change_reason,
+        -- Campos para identificar mudanças
+        CASE 
+            WHEN ol.old_status_id IS DISTINCT FROM ol.new_status_id THEN 'status'
+            WHEN ol.old_due_date IS DISTINCT FROM ol.new_due_date THEN 'due_date'
+            WHEN ol.old_order_number IS DISTINCT FROM ol.new_order_number THEN 'order_number'
+            WHEN ol.old_order_description IS DISTINCT FROM ol.new_order_description THEN 'order_description'
+            ELSE 'other'
+        END AS change_type,
+        -- Label
+        CASE 
+            WHEN ol.old_status_id IS DISTINCT FROM ol.new_status_id THEN 'Status'
+            WHEN ol.old_due_date IS DISTINCT FROM ol.new_due_date THEN 'Data de Vencimento'
+            WHEN ol.old_order_number IS DISTINCT FROM ol.new_order_number THEN 'Número do Pedido'
+            WHEN ol.old_order_description IS DISTINCT FROM ol.new_order_description THEN 'Descrição do Pedido'
+            ELSE 'Outro'
+        END AS change_type_label,
+        -- Descrição da mudança
+        CASE 
+            WHEN ol.old_status_id IS DISTINCT FROM ol.new_status_id THEN 
+                'Status alterado de "' || COALESCE(dos_old.name, 'N/A') || '" para "' || COALESCE(dos_new.name, 'N/A') || '"'
+            WHEN ol.old_due_date IS DISTINCT FROM ol.new_due_date THEN 
+                'Data de vencimento alterada de "' || COALESCE(ol.old_due_date::TEXT, 'N/A') || '" para "' || COALESCE(ol.new_due_date::TEXT, 'N/A') || '"'
+            WHEN ol.old_order_number IS DISTINCT FROM ol.new_order_number THEN 
+                'Número do pedido alterado de "' || COALESCE(ol.old_order_number, 'N/A') || '" para "' || COALESCE(ol.new_order_number, 'N/A') || '"'
+            WHEN ol.old_order_description IS DISTINCT FROM ol.new_order_description THEN 
+                'Descrição do pedido alterada'
+            ELSE 'Alteração realizada'
+        END AS change_description
+    FROM public.order_logs ol
+    JOIN public.orders o ON o.id = ol.order_id
+    JOIN public.suppliers s ON s.id = o.supplier_id
+    LEFT JOIN public.default_order_status dos_old ON dos_old.id = ol.old_status_id
+    LEFT JOIN public.default_order_status dos_new ON dos_new.id = ol.new_status_id
+    
+    UNION ALL
+    
+    -- Logs de itens de pedido
+    SELECT 
+        'item' AS log_type,
+        oil.id,
+        o.id AS order_id, -- ID do pedido (orders.id) ao qual o item pertence
+        oil.order_item_id,
+        oil.changed_by_client,
+        oil.changed_by_supplier,
+        oil.source,
+        oil.created_at,
+        -- Informações do pedido (via item)
+        o.order_number,
+        o.order_description,
+        s.name AS supplier_name,
+        -- Status
+        ois_old.name AS old_status_name,
+        ois_new.name AS new_status_name,
+        -- Outros campos
+        oil.old_due_date,
+        oil.new_due_date,
+        NULL AS old_order_number,
+        NULL AS new_order_number,
+        NULL AS old_order_description,
+        NULL AS new_order_description,
+        NULL AS change_reason,
+        -- Campos para identificar mudanças
+        CASE 
+            WHEN oil.old_status_id IS DISTINCT FROM oil.new_status_id THEN 'status'
+            WHEN oil.old_due_date IS DISTINCT FROM oil.new_due_date THEN 'due_date'
+            WHEN oil.old_product IS DISTINCT FROM oil.new_product THEN 'product'
+            WHEN oil.old_quantity IS DISTINCT FROM oil.new_quantity THEN 'quantity'
+            WHEN oil.old_unit_price IS DISTINCT FROM oil.new_unit_price THEN 'unit_price'
+            WHEN oil.old_current_delivery_date IS DISTINCT FROM oil.new_current_delivery_date THEN 'delivery_date'
+            ELSE 'other'
+        END AS change_type,
+        -- Label
+        CASE 
+            WHEN oil.old_status_id IS DISTINCT FROM oil.new_status_id THEN 'Status'
+            WHEN oil.old_due_date IS DISTINCT FROM oil.new_due_date THEN 'Data de Vencimento'
+            WHEN oil.old_product IS DISTINCT FROM oil.new_product THEN 'Produto'
+            WHEN oil.old_quantity IS DISTINCT FROM oil.new_quantity THEN 'Quantidade'
+            WHEN oil.old_unit_price IS DISTINCT FROM oil.new_unit_price THEN 'Preço Unitário'
+            WHEN oil.old_current_delivery_date IS DISTINCT FROM oil.new_current_delivery_date THEN 'Data de Entrega'
+            ELSE 'Outro'
+        END AS change_type_label,
+        -- Descrição da mudança
+        CASE 
+            WHEN oil.old_status_id IS DISTINCT FROM oil.new_status_id THEN 
+                'Status do item alterado de "' || COALESCE(ois_old.name, 'N/A') || '" para "' || COALESCE(ois_new.name, 'N/A') || '"'
+            WHEN oil.old_due_date IS DISTINCT FROM oil.new_due_date THEN 
+                'Data de vencimento do item alterada de "' || COALESCE(oil.old_due_date::TEXT, 'N/A') || '" para "' || COALESCE(oil.new_due_date::TEXT, 'N/A') || '"'
+            WHEN oil.old_product IS DISTINCT FROM oil.new_product THEN 
+                'Produto alterado de "' || COALESCE(oil.old_product, 'N/A') || '" para "' || COALESCE(oil.new_product, 'N/A') || '"'
+            WHEN oil.old_quantity IS DISTINCT FROM oil.new_quantity THEN 
+                'Quantidade alterada de "' || COALESCE(oil.old_quantity::TEXT, 'N/A') || '" para "' || COALESCE(oil.new_quantity::TEXT, 'N/A') || '"'
+            WHEN oil.old_unit_price IS DISTINCT FROM oil.new_unit_price THEN 
+                'Preço unitário alterado de "' || COALESCE(oil.old_unit_price::TEXT, 'N/A') || '" para "' || COALESCE(oil.new_unit_price::TEXT, 'N/A') || '"'
+            WHEN oil.old_current_delivery_date IS DISTINCT FROM oil.new_current_delivery_date THEN 
+                'Data de entrega alterada de "' || COALESCE(oil.old_current_delivery_date::TEXT, 'N/A') || '" para "' || COALESCE(oil.new_current_delivery_date::TEXT, 'N/A') || '"'
+            ELSE 'Alteração realizada no item'
+        END AS change_description
+    FROM public.order_item_logs oil
+    JOIN public.order_items oi ON oi.id = oil.order_item_id
     JOIN public.orders o ON o.id = oi.order_id
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.is_active = true
-      AND (
-        (uac.role_name IN ('admin', 'comprador') AND o.company_id = uac.company_id)
-        OR (uac.role_name = 'fornecedor' AND o.supplier_id = uac.supplier_id)
-      )
-  )
-);
-
-CREATE POLICY insert_by_suppliers
-ON public.order_item_invoices
-FOR INSERT
-TO authenticated
-WITH CHECK (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    JOIN public.order_items oi ON oi.id = order_item_invoices.order_item_id
-    JOIN public.orders o ON o.id = oi.order_id
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.is_active = true
-      AND uac.role_name = 'fornecedor'
-      AND o.supplier_id = uac.supplier_id
-  )
-  AND order_item_invoices.created_by = (select auth.uid())
-);
-
-CREATE POLICY insert_by_company_users
-ON public.order_item_invoices
-FOR INSERT
-TO authenticated
-WITH CHECK (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    JOIN public.order_items oi ON oi.id = order_item_invoices.order_item_id
-    JOIN public.orders o ON o.id = oi.order_id
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.is_active = true
-      AND uac.role_name IN ('admin', 'comprador')
-      AND o.company_id = uac.company_id
-  )
-  AND order_item_invoices.created_by = (select auth.uid())
-);
-
-CREATE POLICY delete_by_suppliers
-ON public.order_item_invoices
-FOR DELETE
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    JOIN public.order_items oi ON oi.id = order_item_invoices.order_item_id
-    JOIN public.orders o ON o.id = oi.order_id
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.is_active = true
-      AND uac.role_name = 'fornecedor'
-      AND o.supplier_id = uac.supplier_id
-  )
-  AND order_item_invoices.created_by = (select auth.uid())
-);
-
--- UPDATE permitido para usuários da empresa (admin/comprador)
--- Observação: não restringe quais colunas podem ser atualizadas via RLS.
--- Um trigger existente já protege alterações de fields de integridade.
-CREATE POLICY company_users_can_update_order_item_invoices
-ON public.order_item_invoices
-FOR UPDATE
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    JOIN public.order_items oi ON oi.id = order_item_invoices.order_item_id
-    JOIN public.orders o ON o.id = oi.order_id
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.is_active = true
-      AND uac.role_name IN ('admin', 'comprador')
-      AND o.company_id = uac.company_id
-  )
+    JOIN public.suppliers s ON s.id = o.supplier_id
+    LEFT JOIN public.order_item_status ois_old ON ois_old.id = oil.old_status_id
+    LEFT JOIN public.order_item_status ois_new ON ois_new.id = oil.new_status_id
 )
-WITH CHECK (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    JOIN public.order_items oi ON oi.id = order_item_invoices.order_item_id
-    JOIN public.orders o ON o.id = oi.order_id
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.is_active = true
-      AND uac.role_name IN ('admin', 'comprador')
-      AND o.company_id = uac.company_id
-  )
-);
-
--- UPDATE permitido para usuários de fornecedor
-CREATE POLICY suppliers_can_update_order_item_invoices
-ON public.order_item_invoices
-FOR UPDATE
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    JOIN public.order_items oi ON oi.id = order_item_invoices.order_item_id
-    JOIN public.orders o ON o.id = oi.order_id
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.is_active = true
-      AND uac.role_name = 'fornecedor'
-      AND o.supplier_id = uac.supplier_id
-  )
-)
-WITH CHECK (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    JOIN public.order_items oi ON oi.id = order_item_invoices.order_item_id
-    JOIN public.orders o ON o.id = oi.order_id
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.is_active = true
-      AND uac.role_name = 'fornecedor'
-      AND o.supplier_id = uac.supplier_id
-  )
-);
-
-CREATE POLICY superadmins_can_manage_all_order_item_invoices
-ON public.order_item_invoices
-FOR ALL
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1 FROM private.super_admins sa
-    WHERE sa.id = (select auth.uid())
-  )
-)
-WITH CHECK (
-  EXISTS (
-    SELECT 1 FROM private.super_admins sa
-    WHERE sa.id = (select auth.uid())
-  )
-);
-
--- Política de acesso para tabela de logs de pedidos
-CREATE POLICY company_users_can_read_own_order_logs
-ON public.order_logs
-FOR SELECT
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    JOIN public.orders o ON o.id = order_logs.order_id
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.is_active = true
-      AND uac.role_name IN ('admin', 'comprador')
-      AND o.company_id = uac.company_id
-  )
-);
-
-CREATE POLICY superadmins_can_manage_all_order_logs
-ON public.order_logs
-FOR ALL
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1 FROM private.super_admins sa
-    WHERE sa.id = (select auth.uid())
-  )
-)
-WITH CHECK (
-  EXISTS (
-    SELECT 1 FROM private.super_admins sa
-    WHERE sa.id = (select auth.uid())
-  )
-);
-
--- Política de acesso para tabela de logs de pedidos
-CREATE POLICY company_users_can_read_order_notifications
-ON public.order_notifications
-FOR SELECT
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    JOIN public.orders o ON o.id = order_notifications.order_id
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.is_active = true
-      AND uac.role_name IN ('admin', 'comprador')
-      AND o.company_id = uac.company_id
-  )
-);
-
-CREATE POLICY company_users_can_update_order_notifications
-ON public.order_notifications
-FOR UPDATE
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    JOIN public.orders o ON o.id = order_notifications.order_id
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.is_active = true
-      AND uac.role_name IN ('admin', 'comprador')
-      AND o.company_id = uac.company_id
-  )
-)
-WITH CHECK (
-  (
-    read_by IS NULL OR read_by = (select auth.uid())
-  ) AND
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    JOIN public.orders o ON o.id = order_notifications.order_id
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.is_active = true
-      AND uac.role_name IN ('admin', 'comprador')
-      AND o.company_id = uac.company_id
-  )
-);
-
-CREATE POLICY company_users_can_delete_order_notifications
-ON public.order_notifications
-FOR DELETE
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    JOIN public.orders o ON o.id = order_notifications.order_id
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.is_active = true
-      AND o.company_id = uac.company_id
-      AND (
-        uac.role_name = 'admin'
-        OR (
-          uac.role_name = 'comprador'
-          AND order_notifications.read_by = (select auth.uid())
-        )
-      )
-  )
-);
-
-CREATE POLICY superadmins_can_manage_all_order_notifications
-ON public.order_notifications
-FOR ALL
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1 FROM private.super_admins sa
-    WHERE sa.id = (select auth.uid())
-  )
-)
-WITH CHECK (
-  EXISTS (
-    SELECT 1 FROM private.super_admins sa
-    WHERE sa.id = (select auth.uid())
-  )
-);
-
--- Política de acesso para fornecedores lerem notificações do comprador
-CREATE POLICY suppliers_can_read_client_notifications
-ON public.order_notifications
-FOR SELECT
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    JOIN public.orders o ON o.id = order_notifications.order_id
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.is_active = true
-      AND uac.role_name = 'fornecedor'
-      AND o.supplier_id = uac.supplier_id
-      -- Só pode ver notificações do comprador (client_*)
-      AND order_notifications.type IN ('client_observation', 'client_status_change', 'client_item_change')
-  )
-);
-
--- Política de acesso para fornecedores atualizarem notificações (marcar como lida)
-CREATE POLICY suppliers_can_update_client_notifications
-ON public.order_notifications
-FOR UPDATE
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    JOIN public.orders o ON o.id = order_notifications.order_id
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.is_active = true
-      AND uac.role_name = 'fornecedor'
-      AND o.supplier_id = uac.supplier_id
-      -- Só pode atualizar notificações do comprador (client_*)
-      AND order_notifications.type IN ('client_observation', 'client_status_change', 'client_item_change')
-  )
-)
-WITH CHECK (
-  (
-    read_by IS NULL OR read_by = (select auth.uid())
-  ) AND
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    JOIN public.orders o ON o.id = order_notifications.order_id
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.is_active = true
-      AND uac.role_name = 'fornecedor'
-      AND o.supplier_id = uac.supplier_id
-      -- Só pode atualizar notificações do comprador (client_*)
-      AND order_notifications.type IN ('client_observation', 'client_status_change', 'client_item_change')
-  )
-);
-
--- Política de acesso para tabela de logs de itens de pedidos
-CREATE POLICY company_users_can_read_own_order_item_logs
-ON public.order_item_logs
-FOR SELECT
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    JOIN public.orders o ON o.company_id = uac.company_id
-    JOIN public.order_items oi ON oi.order_id = o.id
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.role_name IN ('admin', 'comprador')
-      AND uac.is_active = true
-      AND oi.id = order_item_logs.order_item_id
-  )
-);
-
-CREATE POLICY superadmins_can_manage_all_order_item_logs
-ON public.order_item_logs
-FOR ALL
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1 FROM private.super_admins sa
-    WHERE sa.id = (select auth.uid())
-  )
-)
-WITH CHECK (
-  EXISTS (
-    SELECT 1 FROM private.super_admins sa
-    WHERE sa.id = (select auth.uid())
-  )
-);
-
--- Política de acesso para tabela de configurações de follow-up
-CREATE POLICY company_users_can_read_own_followup_settings
-ON public.followup_settings
-FOR SELECT
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.role_name IN ('admin', 'comprador')
-      AND uac.is_active = true
-      AND uac.company_id = followup_settings.company_id
-  )
-);
-
-CREATE POLICY admins_can_insert_followup_settings
-ON public.followup_settings
-FOR INSERT
-TO authenticated
-WITH CHECK (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.role_name = 'admin'
-      AND uac.is_active = true
-      AND uac.company_id = followup_settings.company_id
-  )
-);
-
-CREATE POLICY admins_can_update_own_followup_settings
-ON public.followup_settings
-FOR UPDATE
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.role_name = 'admin'
-      AND uac.is_active = true
-      AND uac.company_id = followup_settings.company_id
-  )
-)
-WITH CHECK (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.role_name = 'admin'
-      AND uac.is_active = true
-      AND uac.company_id = followup_settings.company_id
-  )
-);
-
-CREATE POLICY admins_can_delete_own_followup_settings
-ON public.followup_settings
-FOR DELETE
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.role_name = 'admin'
-      AND uac.is_active = true
-      AND uac.company_id = followup_settings.company_id
-  )
-);
-
-CREATE POLICY superadmins_can_manage_all_followup_settings
-ON public.followup_settings
-FOR ALL
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1 FROM private.super_admins sa
-    WHERE sa.id = (select auth.uid())
-  )
-)
-WITH CHECK (
-  EXISTS (
-    SELECT 1 FROM private.super_admins sa
-    WHERE sa.id = (select auth.uid())
-  )
-);
-
--- Política de acesso para tabela de associação de regras de follow-up
-CREATE POLICY company_users_can_read_own_followup_suppliers
-ON public.followup_suppliers
-FOR SELECT
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    JOIN public.followup_settings fs ON fs.id = followup_suppliers.followup_setting_id
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.role_name IN ('admin', 'comprador')
-      AND uac.is_active = true
-      AND fs.company_id = uac.company_id
-  )
-);
-
-CREATE POLICY admins_can_insert_followup_suppliers
-ON public.followup_suppliers
-FOR INSERT
-TO authenticated
-WITH CHECK (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    JOIN public.followup_settings fs ON fs.id = followup_suppliers.followup_setting_id
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.role_name = 'admin'
-      AND uac.is_active = true
-      AND fs.company_id = uac.company_id
-  )
-);
-
-CREATE POLICY admins_can_update_own_followup_suppliers
-ON public.followup_suppliers
-FOR UPDATE
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    JOIN public.followup_settings fs ON fs.id = followup_suppliers.followup_setting_id
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.role_name = 'admin'
-      AND uac.is_active = true
-      AND fs.company_id = uac.company_id
-  )
-)
-WITH CHECK (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    JOIN public.followup_settings fs ON fs.id = followup_suppliers.followup_setting_id
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.role_name = 'admin'
-      AND uac.is_active = true
-      AND fs.company_id = uac.company_id
-  )
-);
-
-CREATE POLICY admins_can_delete_own_followup_suppliers
-ON public.followup_suppliers
-FOR DELETE
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    JOIN public.followup_settings fs ON fs.id = followup_suppliers.followup_setting_id
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.role_name = 'admin'
-      AND uac.is_active = true
-      AND fs.company_id = uac.company_id
-  )
-);
-
-CREATE POLICY superadmins_can_manage_all_followup_suppliers
-ON public.followup_suppliers
-FOR ALL
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1 FROM private.super_admins sa
-    WHERE sa.id = (select auth.uid())
-  )
-)
-WITH CHECK (
-  EXISTS (
-    SELECT 1 FROM private.super_admins sa
-    WHERE sa.id = (select auth.uid())
-  )
-);
-
--- Política de acesso para tabela de logs de follow-up
-CREATE POLICY company_users_can_read_own_followup_logs
-ON public.followup_logs
-FOR SELECT
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.role_name IN ('admin', 'comprador')
-      AND uac.is_active = true
-      AND uac.company_id = followup_logs.company_id
-  )
-);
-
-CREATE POLICY superadmins_can_manage_all_followup_logs
-ON public.followup_logs
-FOR ALL
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1 FROM private.super_admins sa
-    WHERE sa.id = (select auth.uid())
-  )
-)
-WITH CHECK (
-  EXISTS (
-    SELECT 1 FROM private.super_admins sa
-    WHERE sa.id = (select auth.uid())
-  )
-);
-
--- Política de acesso para tabela de faturas de clientes
-CREATE POLICY admins_can_read_own_invoices
-ON public.company_invoices
-FOR SELECT
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.role_name = 'admin'
-      AND uac.is_active = true
-      AND uac.company_id = company_invoices.company_id
-  )
-);
-
-CREATE POLICY superadmins_can_manage_all_company_invoices
-ON public.company_invoices
-FOR ALL
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1 FROM private.super_admins sa
-    WHERE sa.id = (select auth.uid())
-  )
-)
-WITH CHECK (
-  EXISTS (
-    SELECT 1 FROM private.super_admins sa
-    WHERE sa.id = (select auth.uid())
-  )
-);
-
--- Política de acesso para tabela de mapeamentos de campos de importação
-CREATE POLICY admin_can_read_own_field_mapping
-ON public.import_field_mappings
-FOR SELECT
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.role_name = 'admin'
-      AND uac.is_active = true
-      AND uac.company_id = import_field_mappings.company_id
-  )
-);
-
-CREATE POLICY admin_can_update_own_field_mapping
-ON public.import_field_mappings
-FOR UPDATE
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.role_name = 'admin'
-      AND uac.is_active = true
-      AND uac.company_id = import_field_mappings.company_id
-  )
-)
-WITH CHECK (
-  EXISTS (
-    SELECT 1
-    FROM private.user_access_cache uac
-    WHERE
-      uac.user_id = (select auth.uid())
-      AND uac.role_name = 'admin'
-      AND uac.is_active = true
-      AND uac.company_id = import_field_mappings.company_id
-  )
-);
-
-CREATE POLICY admin_cant_delete_field_mapping
-ON public.import_field_mappings
-FOR DELETE
-TO authenticated
-USING (FALSE);
-
-CREATE POLICY superadmin_can_manage_all_field_mappings
-ON public.import_field_mappings
-FOR ALL
-TO authenticated
-USING (
-  EXISTS (
-    SELECT 1 FROM private.super_admins sa
-    WHERE sa.id = (select auth.uid())
-  )
-)
-WITH CHECK (
-  EXISTS (
-    SELECT 1 FROM private.super_admins sa
-    WHERE sa.id = (select auth.uid())
-  )
-);
+SELECT 
+    cl.*,
+    -- Informações do usuário que fez a alteração
+    CASE 
+        WHEN cl.changed_by_client IS NOT NULL THEN cu.name
+        WHEN cl.changed_by_supplier IS NOT NULL THEN sc.name
+        ELSE 'Sistema'
+    END AS changed_by_name,
+    CASE 
+        WHEN cl.changed_by_client IS NOT NULL THEN cu.email
+        WHEN cl.changed_by_supplier IS NOT NULL THEN sc.email
+        ELSE NULL
+    END AS changed_by_email,
+    -- Tipo de usuário
+    CASE 
+        WHEN cl.changed_by_client IS NOT NULL THEN 'Cliente'
+        WHEN cl.changed_by_supplier IS NOT NULL THEN 'Fornecedor'
+        ELSE 'Sistema'
+    END AS user_type,
+    -- Informações do item (se aplicável)
+    oi.item_number,
+    oi.product AS item_product,
+    oi.product_description AS item_product_description,
+    -- Formatação de data
+    TO_CHAR(cl.created_at, 'DD/MM/YYYY HH24:MI:SS') AS formatted_created_at,
+    -- Tempo relativo
+    CASE 
+        WHEN cl.created_at > NOW() - INTERVAL '1 hour' THEN 'Agora mesmo'
+        WHEN cl.created_at > NOW() - INTERVAL '24 hours' THEN 
+            EXTRACT(HOUR FROM NOW() - cl.created_at)::TEXT || ' horas atrás'
+        WHEN cl.created_at > NOW() - INTERVAL '7 days' THEN 
+            EXTRACT(DAY FROM NOW() - cl.created_at)::TEXT || ' dias atrás'
+        ELSE TO_CHAR(cl.created_at, 'DD/MM/YYYY')
+    END AS relative_time
+FROM combined_logs cl
+LEFT JOIN public.company_users cu ON cu.id = cl.changed_by_client
+LEFT JOIN public.supplier_contacts sc ON sc.id = cl.changed_by_supplier
+LEFT JOIN public.order_items oi ON oi.id = cl.order_item_id
+ORDER BY cl.created_at DESC;

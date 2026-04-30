@@ -347,6 +347,14 @@ CREATE TABLE public.order_notifications (
 
 CREATE INDEX idx_order_notifications_order ON public.order_notifications(order_id);
 CREATE INDEX idx_order_notifications_order_item ON public.order_notifications(order_item_id);
+-- Suporte a listagens PostgREST em view_order_notifications (ORDER BY is_read, created_at)
+CREATE INDEX idx_order_notifications_order_read_created_at
+    ON public.order_notifications (order_id, is_read, created_at DESC);
+CREATE INDEX idx_order_notifications_order_item_read_created_at
+    ON public.order_notifications (order_item_id, is_read, created_at DESC)
+    WHERE order_item_id IS NOT NULL;
+CREATE INDEX idx_order_notifications_is_read_type
+    ON public.order_notifications (is_read, type);
 
 -- Criar tabela para registrar alterações nos itens do pedido
 CREATE TABLE public.order_item_logs (
