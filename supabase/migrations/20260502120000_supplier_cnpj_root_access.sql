@@ -1,70 +1,6 @@
--- Fornecedor: match exacto supplier_id OU (cnpj_root + mesmo e-mail activo em ≥2 suppliers
--- do grupo + e-mail do utilizador no contacto UAC). SECURITY DEFINER evita recursão com RLS.
+-- fn_supplier_access_from_uac: defined in 20260430120100_multi_supplier_auth_functions_views.sql (email expansion + performance-friendly EXISTS).
 
-CREATE OR REPLACE FUNCTION private.fn_supplier_access_from_uac(
-  p_uac_supplier_id bigint,
-  p_uac_company_id bigint,
-  p_resource_supplier_id bigint
-)
-RETURNS boolean
-LANGUAGE sql
-STABLE
-SECURITY DEFINER
-SET search_path TO 'public'
-AS $$
-  SELECT
-    p_uac_supplier_id IS NOT NULL
-    AND EXISTS (
-      SELECT 1
-      FROM public.suppliers s_res
-      JOIN public.suppliers s_uac ON s_uac.id = p_uac_supplier_id
-      WHERE s_res.id = p_resource_supplier_id
-        AND s_res.company_id = p_uac_company_id
-        AND s_uac.company_id = p_uac_company_id
-        AND (
-          s_res.id = s_uac.id
-          OR (
-            s_res.id <> s_uac.id
-            AND s_res.cnpj_root IS NOT NULL
-            AND s_uac.cnpj_root IS NOT NULL
-            AND s_res.cnpj_root = s_uac.cnpj_root
-            AND EXISTS (
-              SELECT 1
-              FROM public.supplier_contacts sc_res
-              WHERE sc_res.supplier_id = s_res.id
-                AND sc_res.is_active = true
-                AND EXISTS (
-                  SELECT 1
-                  FROM public.supplier_users su
-                  JOIN public.supplier_contacts sc_u ON sc_u.id = su.supplier_contact_id
-                  WHERE su.auth_user_id = (SELECT auth.uid())
-                    AND sc_u.supplier_id = p_uac_supplier_id
-                    AND sc_u.is_active = true
-                    AND lower(trim(sc_u.email)) = lower(trim(sc_res.email))
-                )
-                AND (
-                  SELECT COUNT(DISTINCT sc2.supplier_id)
-                  FROM public.supplier_contacts sc2
-                  JOIN public.suppliers s2 ON s2.id = sc2.supplier_id
-                  WHERE sc2.is_active = true
-                    AND s2.company_id = p_uac_company_id
-                    AND s2.cnpj_root IS NOT NULL
-                    AND s2.cnpj_root = s_res.cnpj_root
-                    AND lower(trim(sc2.email)) = lower(trim(sc_res.email))
-                ) >= 2
-            )
-          )
-        )
-    );
-$$;
-
-COMMENT ON FUNCTION private.fn_supplier_access_from_uac(bigint, bigint, bigint) IS
-  'Fornecedor: mesmo supplier_id OU (cnpj_root + email em ≥2 suppliers do grupo + email do user no UAC supplier). SECURITY DEFINER.';
-
-REVOKE ALL ON FUNCTION private.fn_supplier_access_from_uac(bigint, bigint, bigint) FROM PUBLIC;
-GRANT EXECUTE ON FUNCTION private.fn_supplier_access_from_uac(bigint, bigint, bigint) TO authenticated;
-
--- Resolver contacto do login para pedidos de qualquer supplier do mesmo cnpj_root.
+-- Resolve supplier_contact for orders (uses fn_supplier_access_from_uac).
 CREATE OR REPLACE FUNCTION private.fn_resolve_supplier_contact_for_order(
   p_auth_user_id uuid,
   p_order_id bigint
@@ -107,6 +43,12 @@ AS $$
   ORDER BY CASE WHEN sc.supplier_id = o.supplier_id THEN 0 ELSE 1 END, sc.id
   LIMIT 1;
 $$;
+
+COMMENT ON FUNCTION private.fn_resolve_supplier_contact_for_order(uuid, bigint) IS
+  'Resolves supplier_contact for an order using fn_supplier_access_from_uac (email-based expansion within company).';
+
+COMMENT ON FUNCTION private.fn_resolve_supplier_contact_for_order_item(uuid, bigint) IS
+  'Resolves supplier_contact for an order item using fn_supplier_access_from_uac (email-based expansion within company).';
 
 -- ═══════════════════════════════════════════════════════════════════════════
 -- RLS: substituir match estrito supplier_id = uac.supplier_id
@@ -456,7 +398,7 @@ WITH CHECK (
 );
 
 -- ═══════════════════════════════════════════════════════════════════════════
--- RPCs SECURITY DEFINER: checagens de fornecedor alinhadas ao cnpj_root
+-- RPCs SECURITY DEFINER: supplier checks aligned with fn_supplier_access_from_uac (email expansion)
 -- ═══════════════════════════════════════════════════════════════════════════
 
 CREATE OR REPLACE FUNCTION public.fn_update_order_status(

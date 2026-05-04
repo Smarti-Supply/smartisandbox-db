@@ -183,6 +183,10 @@ CREATE TABLE public.supplier_contacts (
 -- Índices opcionais para melhorar a performance
 CREATE INDEX idx_supplier_contacts_supplier ON public.supplier_contacts(supplier_id);
 CREATE INDEX idx_supplier_contacts_email ON public.supplier_contacts(email);
+-- Partial index for supplier RLS email expansion (lower(trim(email))) lookups on active contacts
+CREATE INDEX IF NOT EXISTS idx_supplier_contacts_active_norm_email_supplier
+ON public.supplier_contacts (lower(trim(email)), supplier_id)
+WHERE is_active = true;
 
 
 -- Criar tabela de usuários fornecedores (para o app do fornecedor)

@@ -147,3 +147,150 @@ ALTER TABLE public.suppliers
   ) STORED;
 
 CREATE INDEX IF NOT EXISTS idx_suppliers_cnpj_root ON public.suppliers (cnpj_root);
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- supplier_users RLS (table recreated above; policies from 20250218125702 do not carry over)
+-- ═══════════════════════════════════════════════════════════════════════════
+
+ALTER TABLE public.supplier_users ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS supplier_self_can_select_own_supplier_users ON public.supplier_users;
+CREATE POLICY supplier_self_can_select_own_supplier_users
+ON public.supplier_users
+FOR SELECT
+TO authenticated
+USING (auth_user_id = (select auth.uid()));
+
+DROP POLICY IF EXISTS supplier_self_can_update_own_supplier_users ON public.supplier_users;
+CREATE POLICY supplier_self_can_update_own_supplier_users
+ON public.supplier_users
+FOR UPDATE
+TO authenticated
+USING (auth_user_id = (select auth.uid()))
+WITH CHECK (auth_user_id = (select auth.uid()));
+
+DROP POLICY IF EXISTS client_admins_can_read_own_supplier_users ON public.supplier_users;
+CREATE POLICY client_admins_can_read_own_supplier_users
+ON public.supplier_users
+FOR SELECT
+TO authenticated
+USING (
+  EXISTS (
+    SELECT 1
+    FROM private.user_access_cache uac
+    JOIN public.supplier_contacts sc ON sc.id = supplier_users.supplier_contact_id
+    JOIN public.suppliers s ON sc.supplier_id = s.id
+    WHERE
+      uac.user_id = (select auth.uid())
+      AND uac.role_name = 'admin'
+      AND uac.is_active = true
+      AND s.company_id = uac.company_id
+  )
+);
+
+DROP POLICY IF EXISTS client_buyers_can_read_own_supplier_users ON public.supplier_users;
+CREATE POLICY client_buyers_can_read_own_supplier_users
+ON public.supplier_users
+FOR SELECT
+TO authenticated
+USING (
+  EXISTS (
+    SELECT 1
+    FROM private.user_access_cache uac
+    JOIN public.supplier_contacts sc ON sc.id = supplier_users.supplier_contact_id
+    JOIN public.suppliers s ON sc.supplier_id = s.id
+    WHERE
+      uac.user_id = (select auth.uid())
+      AND uac.role_name = 'comprador'
+      AND uac.is_active = true
+      AND s.company_id = uac.company_id
+  )
+);
+
+DROP POLICY IF EXISTS client_admins_can_insert_supplier_users ON public.supplier_users;
+CREATE POLICY client_admins_can_insert_supplier_users
+ON public.supplier_users
+FOR INSERT
+TO authenticated
+WITH CHECK (
+  EXISTS (
+    SELECT 1
+    FROM private.user_access_cache uac
+    JOIN public.supplier_contacts sc ON sc.id = supplier_users.supplier_contact_id
+    JOIN public.suppliers s ON s.id = sc.supplier_id
+    WHERE
+      uac.user_id = (select auth.uid())
+      AND uac.role_name = 'admin'
+      AND uac.is_active = true
+      AND s.company_id = uac.company_id
+  )
+);
+
+DROP POLICY IF EXISTS client_admin_can_update_own_supplier_users ON public.supplier_users;
+CREATE POLICY client_admin_can_update_own_supplier_users
+ON public.supplier_users
+FOR UPDATE
+TO authenticated
+USING (
+  EXISTS (
+    SELECT 1
+    FROM private.user_access_cache uac
+    JOIN public.supplier_contacts sc ON sc.id = supplier_users.supplier_contact_id
+    JOIN public.suppliers s ON sc.supplier_id = s.id
+    WHERE
+      uac.user_id = (select auth.uid())
+      AND uac.role_name = 'admin'
+      AND uac.is_active = true
+      AND s.company_id = uac.company_id
+  )
+)
+WITH CHECK (
+  EXISTS (
+    SELECT 1
+    FROM private.user_access_cache uac
+    JOIN public.supplier_contacts sc ON sc.id = supplier_users.supplier_contact_id
+    JOIN public.suppliers s ON sc.supplier_id = s.id
+    WHERE
+      uac.user_id = (select auth.uid())
+      AND uac.role_name = 'admin'
+      AND uac.is_active = true
+      AND s.company_id = uac.company_id
+  )
+);
+
+DROP POLICY IF EXISTS client_admin_can_delete_own_supplier_users ON public.supplier_users;
+CREATE POLICY client_admin_can_delete_own_supplier_users
+ON public.supplier_users
+FOR DELETE
+TO authenticated
+USING (
+  EXISTS (
+    SELECT 1
+    FROM private.user_access_cache uac
+    JOIN public.supplier_contacts sc ON sc.id = supplier_users.supplier_contact_id
+    JOIN public.suppliers s ON sc.supplier_id = s.id
+    WHERE
+      uac.user_id = (select auth.uid())
+      AND uac.role_name = 'admin'
+      AND uac.is_active = true
+      AND s.company_id = uac.company_id
+  )
+);
+
+DROP POLICY IF EXISTS superadmins_can_manage_all_supplier_users ON public.supplier_users;
+CREATE POLICY superadmins_can_manage_all_supplier_users
+ON public.supplier_users
+FOR ALL
+TO authenticated
+USING (
+  EXISTS (
+    SELECT 1 FROM private.super_admins sa
+    WHERE sa.id = (select auth.uid())
+  )
+)
+WITH CHECK (
+  EXISTS (
+    SELECT 1 FROM private.super_admins sa
+    WHERE sa.id = (select auth.uid())
+  )
+);
