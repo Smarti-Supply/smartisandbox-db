@@ -126,12 +126,22 @@ function createTimelineEvents(
   }
 
   for (const log of orderChangeLogs) {
+    const logType = log.log_type as string | undefined;
+    // Relatório: só alterações de status ao nível de item (não status do pedido nem outras mudanças de item).
+    if (logType === "order") continue;
+
     const createdAt = log.created_at as string | undefined;
     const formattedCreatedAt = log.formatted_created_at as string | undefined;
     let changeDescription = log.change_description as string | undefined;
     const numeroItem = log.item_number as number | undefined;
 
     if (!changeDescription) continue;
+    if (
+      logType === "item" &&
+      !/^Status do item\b/i.test(changeDescription)
+    ) {
+      continue;
+    }
     // Não exibir alterações genéricas sem detalhe
     if (
       changeDescription === "Alteração realizada" ||

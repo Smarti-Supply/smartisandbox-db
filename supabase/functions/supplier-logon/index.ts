@@ -46,38 +46,48 @@ Deno.serve(async (req: Request): Promise<Response> => {
       );
     }
 
-    const { data: contact, error: contactError } = await supabase
+    const { data: contacts, error: contactsError } = await supabase
       .schema("public")
       .from("supplier_contacts")
       .select("id")
-      .eq("email", user_email)
-      .single();
+      .eq("email", user_email);
 
-    if (contactError || !contact) {
+    if (contactsError || !contacts?.length) {
       return jsonResponse({ success: true }, 200, corsHeaders);
     }
 
-    const { data: supplierUser, error: supplierUserError } = await supabase
+    const contactIds = contacts.map((c) => c.id);
+
+    const { data: supplierUsers, error: supplierUsersError } = await supabase
       .schema("public")
       .from("supplier_users")
-      .select("id, role_id, last_login, last_magic_link_requested_at")
-      .eq("supplier_contact_id", contact.id)
-      .single();
+      .select("id, auth_user_id, last_magic_link_requested_at")
+      .in("supplier_contact_id", contactIds);
 
-    if (supplierUserError || !supplierUser) {
+    if (supplierUsersError || !supplierUsers?.length) {
       return jsonResponse({ success: true }, 200, corsHeaders);
     }
 
     const nowMs = Date.now();
+    const latestCooldownAt = supplierUsers.reduce<string | null>(
+      (latest, row) => {
+        const t = row.last_magic_link_requested_at as string | null;
+        if (!t) return latest;
+        if (!latest) return t;
+        return new Date(t).getTime() > new Date(latest).getTime() ? t : latest;
+      },
+      null,
+    );
+
     if (
       isWithinMagicLinkCooldown(
-        supplierUser.last_magic_link_requested_at as string | null,
+        latestCooldownAt,
         MAGIC_LINK_COOLDOWN_MS,
         nowMs,
       )
     ) {
       const retryAfter = magicLinkCooldownRemainingSeconds(
-        supplierUser.last_magic_link_requested_at as string | null,
+        latestCooldownAt,
         MAGIC_LINK_COOLDOWN_MS,
         nowMs,
       );
@@ -136,11 +146,12 @@ Deno.serve(async (req: Request): Promise<Response> => {
       );
     }
 
+    const linkRowIds = supplierUsers.map((r) => r.id);
     const { error: updateError } = await supabase
       .schema("public")
       .from("supplier_users")
       .update({ last_magic_link_requested_at: new Date().toISOString() })
-      .eq("id", supplierUser.id);
+      .in("id", linkRowIds);
 
     if (updateError) {
       console.error(

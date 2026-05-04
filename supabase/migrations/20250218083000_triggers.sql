@@ -744,6 +744,9 @@ EXECUTE FUNCTION private.fn_handle_new_company();
 -- ┃                   Funções triggers para storage                    ┃
 -- ╰────────────────────────────────────────────────────────────────────╯
 
+-- Limpeza: RPC experimental de import (não utilizada; evita objecto órfão em resets).
+DROP FUNCTION IF EXISTS public.fn_insert_suppliers_with_contacts(JSONB, TEXT, TEXT);
+
 -- Função trigger para processar upload imediatamente via AWS Lambda
 CREATE OR REPLACE FUNCTION private.fn_new_file_upload()
 RETURNS TRIGGER
