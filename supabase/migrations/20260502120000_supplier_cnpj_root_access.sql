@@ -579,13 +579,33 @@ BEGIN
 END;
 $$;
 
+-- =============================================================================
+-- fn_insert_order_item_invoice — dual-mode (order_item vs order)
+-- =============================================================================
+-- MODE A — order_item objects: each element has "order_id" key.
+--   Fields read: id (order_item id), quantity, invoiced_value / total_price.
+--   p_quantity overrides per-item quantity when provided.
+--
+-- MODE B — order objects: each element has NO "order_id" key.
+--   The function fetches ALL order_items for that order and invoices each one.
+--   Fields read: id (order id). p_quantity used per item;
+--   invoiced_value = unit_price * effective_quantity.
+--
+-- p_items may be a JSON object (normalised to single-element array) or array.
+-- Guards: duplicate NFe per item; auto-cap quantity to remaining (no error).
+-- =============================================================================
+
+-- Drop all previous overloads to avoid PGRST203 ambiguity.
+DROP FUNCTION IF EXISTS public.fn_insert_order_item_invoice(bigint, text, date, numeric, numeric, text);
+DROP FUNCTION IF EXISTS public.fn_insert_order_item_invoice(bigint, text, date, numeric, numeric, text, bigint);
+DROP FUNCTION IF EXISTS public.fn_insert_order_item_invoice(jsonb, text, date, bigint);
+
 CREATE OR REPLACE FUNCTION public.fn_insert_order_item_invoice(
-  p_order_item_id BIGINT,
-  p_nfe_number TEXT,
-  p_nfe_date DATE,
-  p_quantity NUMERIC(12,2),
-  p_invoiced_value NUMERIC(12,2),
-  p_volumes TEXT DEFAULT NULL
+  p_items         JSONB,
+  nfe_number      TEXT,
+  nfe_date        DATE,
+  p_quantity      NUMERIC(12,2) DEFAULT NULL,
+  p_new_status_id BIGINT        DEFAULT 2
 )
 RETURNS VOID
 LANGUAGE plpgsql
@@ -593,47 +613,180 @@ SECURITY DEFINER
 SET search_path TO 'public', 'private'
 AS $$
 DECLARE
-  v_uid UUID := (SELECT auth.uid());
-  v_role_name TEXT;
-  v_supplier_contact_id BIGINT;
-  v_order_item_exists BOOLEAN;
+  STATUS_PENDING_CONFIRMATION_ID CONSTANT BIGINT := 1;
+
+  v_uid                 UUID   := (SELECT auth.uid());
+  v_role_name           TEXT;
+
+  -- Local copies of shared params — avoids ambiguity with same-named columns.
+  v_nfe_number     TEXT;
+  v_nfe_date       DATE;
+
+  -- Outer loop (over p_items elements)
+  v_item           JSONB;
+
+  -- Values resolved per order_item being processed
+  v_order_item_id  BIGINT;
+  v_quantity       NUMERIC(12,2);
+  v_invoiced_value NUMERIC(12,2);
+  v_volumes        TEXT;
+
+  -- Used when mode B (order object): inner loop over order's items
+  v_order_id       BIGINT;
+  r_oi             RECORD;
 BEGIN
-  IF p_nfe_number IS NULL OR trim(p_nfe_number) = '' THEN
-    RAISE EXCEPTION 'Número da NFe não pode ser vazio.';
-  ELSIF p_nfe_date IS NULL THEN
-    RAISE EXCEPTION 'Data da NFe não pode ser nula.';
-  ELSIF p_quantity IS NULL OR p_quantity <= 0 THEN
-    RAISE EXCEPTION 'Quantidade faturada deve ser maior que zero.';
-  ELSIF p_invoiced_value IS NULL OR p_invoiced_value < 0 THEN
-    RAISE EXCEPTION 'Valor faturado não pode ser negativo.';
+
+  -- ── Validate shared parameters ───────────────────────────────────────────
+  IF p_items IS NULL THEN
+    RAISE EXCEPTION 'p_items cannot be null.';
   END IF;
 
+  -- Normalise: wrap a bare object into a single-element array.
+  IF jsonb_typeof(p_items) = 'object' THEN
+    p_items := jsonb_build_array(p_items);
+  END IF;
+
+  IF jsonb_typeof(p_items) <> 'array' OR jsonb_array_length(p_items) = 0 THEN
+    RAISE EXCEPTION 'p_items must be a non-empty JSON object or array.';
+  END IF;
+
+  IF nfe_number IS NULL OR trim(nfe_number) = '' THEN
+    RAISE EXCEPTION 'NFe number cannot be empty.';
+  END IF;
+
+  IF nfe_date IS NULL THEN
+    RAISE EXCEPTION 'NFe date cannot be null.';
+  END IF;
+
+  -- Copy to unambiguous local variables.
+  v_nfe_number := nfe_number;
+  v_nfe_date   := nfe_date;
+
+  -- ── Resolve caller role (once for the whole batch) ───────────────────────
   SELECT uac.role_name
   INTO v_role_name
   FROM private.user_access_cache uac
-  WHERE uac.user_id = v_uid
+  WHERE uac.user_id  = v_uid
     AND uac.is_active = true
-    AND (
-      uac.role_name IN ('admin', 'comprador')
-      OR (
-        uac.role_name = 'fornecedor'
-        AND EXISTS (
-          SELECT 1
-          FROM public.order_items oi0
-          JOIN public.orders o ON o.id = oi0.order_id
-          WHERE oi0.id = p_order_item_id
-            AND o.company_id = uac.company_id
-            AND private.fn_supplier_access_from_uac(uac.supplier_id, uac.company_id, o.supplier_id)
-        )
-      )
-    )
+    AND uac.role_name IN ('admin', 'comprador', 'fornecedor')
   LIMIT 1;
 
   IF NOT FOUND THEN
-    RAISE EXCEPTION 'Usuário % não encontrado ou sem acesso.', v_uid;
+    RAISE EXCEPTION 'User % not found or has no access.', v_uid;
   END IF;
 
   IF v_role_name = 'fornecedor' THEN
+    PERFORM set_config('request.source',  'supplier',  true);
+    PERFORM set_config('request.user_id', v_uid::TEXT, true);
+  ELSIF v_role_name IN ('admin', 'comprador') THEN
+    PERFORM set_config('request.source',  'client',    true);
+    PERFORM set_config('request.user_id', v_uid::TEXT, true);
+  ELSE
+    RAISE EXCEPTION 'Access denied: user % does not have permission to insert invoices.', v_uid;
+  END IF;
+
+  -- ── Outer loop: iterate over each element of p_items ────────────────────
+  FOR v_item IN SELECT value FROM jsonb_array_elements(p_items)
+  LOOP
+    v_volumes := v_item->>'volumes';  -- optional, same for all sub-items
+
+    -- ────────────────────────────────────────────────────────────────────────
+    -- MODE A: ORDER ITEM object — has "order_id" key
+    -- ────────────────────────────────────────────────────────────────────────
+    IF v_item ? 'order_id' THEN
+
+      v_order_item_id  := (v_item->>'id')::BIGINT;
+      v_quantity       := COALESCE(p_quantity, (v_item->>'quantity')::NUMERIC(12,2));
+      v_invoiced_value := COALESCE(
+        (v_item->>'invoiced_value')::NUMERIC(12,2),
+        (v_item->>'total_price')::NUMERIC(12,2)
+      );
+
+      PERFORM private.fn_invoice_order_item(
+        v_uid, v_role_name,
+        v_order_item_id, v_quantity, v_invoiced_value, v_volumes,
+        v_nfe_number, v_nfe_date,
+        p_new_status_id, STATUS_PENDING_CONFIRMATION_ID
+      );
+
+    -- ────────────────────────────────────────────────────────────────────────
+    -- MODE B: ORDER object — no "order_id" key; invoice all its order_items
+    -- ────────────────────────────────────────────────────────────────────────
+    ELSE
+
+      v_order_id := (v_item->>'id')::BIGINT;
+
+      IF v_order_id IS NULL THEN
+        RAISE EXCEPTION 'id (order id) is required in every order object.';
+      END IF;
+
+      FOR r_oi IN
+        SELECT oi.id, oi.quantity, oi.unit_price
+        FROM public.order_items oi
+        WHERE oi.order_id = v_order_id
+      LOOP
+        -- Effective quantity: caller override → item's own quantity
+        v_quantity       := COALESCE(p_quantity, r_oi.quantity);
+        -- Invoiced value proportional to effective quantity
+        v_invoiced_value := ROUND(r_oi.unit_price * v_quantity, 2);
+
+        PERFORM private.fn_invoice_order_item(
+          v_uid, v_role_name,
+          r_oi.id, v_quantity, v_invoiced_value, v_volumes,
+          v_nfe_number, v_nfe_date,
+          p_new_status_id, STATUS_PENDING_CONFIRMATION_ID
+        );
+      END LOOP;
+
+    END IF;
+  END LOOP;
+
+END;
+$$;
+
+
+-- =============================================================================
+-- Private helper: all per-item logic (access, guards, insert, status update)
+-- =============================================================================
+CREATE OR REPLACE FUNCTION private.fn_invoice_order_item(
+  p_uid                         UUID,
+  p_role_name                   TEXT,
+  p_order_item_id               BIGINT,
+  p_quantity                    NUMERIC(12,2),
+  p_invoiced_value              NUMERIC(12,2),
+  p_volumes                     TEXT,
+  p_nfe_number                  TEXT,
+  p_nfe_date                    DATE,
+  p_new_status_id               BIGINT,
+  p_status_pending_confirmation BIGINT
+)
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path TO 'public', 'private'
+AS $$
+DECLARE
+  v_supplier_contact_id      BIGINT;
+  v_order_item_exists        BOOLEAN;
+  v_item_quantity            NUMERIC(12,2);
+  v_already_invoiced         NUMERIC(12,2);
+  v_remaining                NUMERIC(12,2);
+  v_effective_quantity       NUMERIC(12,2);
+  v_effective_invoiced_value NUMERIC(12,2);
+BEGIN
+
+  -- ── Per-item field validation ──────────────────────────────────────────
+  IF p_order_item_id IS NULL THEN
+    RAISE EXCEPTION 'order_item_id is required.';
+  ELSIF p_quantity IS NULL OR p_quantity <= 0 THEN
+    RAISE EXCEPTION 'Invoiced quantity must be greater than zero (item id: %).', p_order_item_id;
+  ELSIF p_invoiced_value IS NULL OR p_invoiced_value < 0 THEN
+    RAISE EXCEPTION 'Invoiced value cannot be negative (item id: %).', p_order_item_id;
+  END IF;
+
+  -- ── Access check ──────────────────────────────────────────────────────
+  IF p_role_name = 'fornecedor' THEN
+
     SELECT EXISTS (
       SELECT 1
       FROM public.order_items oi
@@ -642,49 +795,82 @@ BEGIN
         AND EXISTS (
           SELECT 1
           FROM private.user_access_cache uac2
-          WHERE uac2.user_id = v_uid
+          WHERE uac2.user_id  = p_uid
             AND uac2.is_active = true
             AND uac2.role_name = 'fornecedor'
-            AND o.company_id = uac2.company_id
+            AND o.company_id   = uac2.company_id
             AND private.fn_supplier_access_from_uac(uac2.supplier_id, uac2.company_id, o.supplier_id)
         )
     ) INTO v_order_item_exists;
 
     IF NOT v_order_item_exists THEN
-      RAISE EXCEPTION 'Item de pedido % não encontrado ou não pertence ao fornecedor.', p_order_item_id;
+      RAISE EXCEPTION 'Order item % not found or does not belong to the supplier.', p_order_item_id;
     END IF;
 
-    v_supplier_contact_id := private.fn_resolve_supplier_contact_for_order_item(v_uid, p_order_item_id);
+    v_supplier_contact_id := private.fn_resolve_supplier_contact_for_order_item(p_uid, p_order_item_id);
     IF v_supplier_contact_id IS NULL THEN
-      RAISE EXCEPTION 'Supplier contact not resolved for user % and order item %.', v_uid, p_order_item_id;
+      RAISE EXCEPTION 'Supplier contact not resolved for user % and order item %.', p_uid, p_order_item_id;
     END IF;
 
-    PERFORM set_config('request.source', 'supplier', true);
     PERFORM set_config('request.supplier_contact_id', v_supplier_contact_id::TEXT, true);
-    PERFORM set_config('request.user_id', v_uid::TEXT, true);
 
-  ELSIF v_role_name IN ('admin', 'comprador') THEN
+  ELSIF p_role_name IN ('admin', 'comprador') THEN
+
     SELECT EXISTS (
       SELECT 1
       FROM public.order_items oi
       JOIN public.orders o ON o.id = oi.order_id
       JOIN private.user_access_cache uac ON uac.company_id = o.company_id
-      WHERE oi.id = p_order_item_id
-        AND uac.user_id = v_uid
+      WHERE oi.id       = p_order_item_id
+        AND uac.user_id  = p_uid
         AND uac.is_active = true
     ) INTO v_order_item_exists;
 
     IF NOT v_order_item_exists THEN
-      RAISE EXCEPTION 'Item de pedido % não encontrado ou não pertence à empresa.', p_order_item_id;
+      RAISE EXCEPTION 'Order item % not found or does not belong to the company.', p_order_item_id;
     END IF;
 
-    PERFORM set_config('request.source', 'client', true);
-    PERFORM set_config('request.user_id', v_uid::TEXT, true);
-
-  ELSE
-    RAISE EXCEPTION 'Acesso negado: usuário % não tem permissão para inserir faturamentos.', v_uid;
   END IF;
 
+  -- ── Duplicate NFe guard ────────────────────────────────────────────────
+  IF EXISTS (
+    SELECT 1
+    FROM public.order_item_invoices oii
+    WHERE oii.order_item_id = p_order_item_id
+      AND oii.nfe_number    = p_nfe_number
+  ) THEN
+    RAISE EXCEPTION
+      'Item % has already been invoiced with NFe %. Duplicate insertion is not allowed.',
+      p_order_item_id, p_nfe_number;
+  END IF;
+
+  -- ── Quantity resolution ────────────────────────────────────────────────
+  -- If caller requested more than what remains, auto-cap to remaining.
+  -- If already fully invoiced, skip silently.
+  SELECT oi.quantity, COALESCE(SUM(oii.quantity), 0)
+  INTO v_item_quantity, v_already_invoiced
+  FROM public.order_items oi
+  LEFT JOIN public.order_item_invoices oii ON oii.order_item_id = oi.id
+  WHERE oi.id = p_order_item_id
+  GROUP BY oi.quantity;
+
+  v_remaining := v_item_quantity - v_already_invoiced;
+
+  IF v_remaining <= 0 THEN
+    -- Item already fully invoiced — nothing to do for this item.
+    RETURN;
+  END IF;
+
+  IF p_quantity > v_remaining THEN
+    -- Auto-adjust to remaining quantity; recalculate invoiced_value proportionally.
+    v_effective_quantity       := v_remaining;
+    v_effective_invoiced_value := ROUND((p_invoiced_value / p_quantity) * v_remaining, 2);
+  ELSE
+    v_effective_quantity       := p_quantity;
+    v_effective_invoiced_value := p_invoiced_value;
+  END IF;
+
+  -- ── Insert invoice ─────────────────────────────────────────────────────
   INSERT INTO public.order_item_invoices (
     order_item_id,
     nfe_number,
@@ -698,11 +884,18 @@ BEGIN
     p_order_item_id,
     p_nfe_number,
     p_nfe_date,
-    p_quantity,
-    p_invoiced_value,
+    v_effective_quantity,
+    v_effective_invoiced_value,
     p_volumes,
-    v_uid
+    p_uid
   );
+
+  -- ── Advance item status when still at "awaiting confirmation" ──────────
+  UPDATE public.order_items
+  SET status_id = p_new_status_id
+  WHERE id        = p_order_item_id
+    AND status_id = p_status_pending_confirmation;
+
 END;
 $$;
 

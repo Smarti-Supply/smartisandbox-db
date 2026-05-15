@@ -1784,3 +1784,67 @@ CREATE TRIGGER trg_notify_client_item_change
 AFTER UPDATE ON public.order_items
 FOR EACH ROW
 EXECUTE FUNCTION private.fn_notify_client_item_change();
+
+
+-- ╭──────────────────────◉ Cancelamento de itens ◉─────────────────────────╮
+-- ┃  Zera quantity ao cancelar; restaura ao reverter o status              ┃
+-- ┃  Nome "trg_z..." garante execução APÓS trg_restrict_supplier_update    ┃
+-- ╰────────────────────────────────────────────────────────────────────────╯
+
+CREATE OR REPLACE FUNCTION private.fn_zero_quantity_on_cancellation()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path TO 'public'
+AS $$
+DECLARE
+  v_cancel_status_ids BIGINT[];
+BEGIN
+  IF NEW.status_id IS NOT DISTINCT FROM OLD.status_id THEN
+    RETURN NEW;
+  END IF;
+
+  SELECT ARRAY_AGG(id)
+    INTO v_cancel_status_ids
+    FROM public.order_item_status
+   WHERE name IN (
+     'Pedido cancelado motivado pelo fornecedor',
+     'Pedido cancelado motivado pela Transpetro'
+   );
+
+  IF v_cancel_status_ids IS NULL THEN
+    RETURN NEW;
+  END IF;
+
+  -- Moving TO a cancellation status: zero out quantity, preserve original
+  IF NEW.status_id = ANY(v_cancel_status_ids)
+     AND (OLD.status_id IS NULL OR NOT (OLD.status_id = ANY(v_cancel_status_ids)))
+  THEN
+    IF NEW.original_quantity IS NULL THEN
+      NEW.original_quantity := OLD.quantity;
+    END IF;
+    NEW.quantity := 0;
+    RETURN NEW;
+  END IF;
+
+  -- Moving FROM a cancellation status: restore original quantity
+  IF OLD.status_id = ANY(v_cancel_status_ids)
+     AND NOT (NEW.status_id = ANY(v_cancel_status_ids))
+  THEN
+    IF NEW.original_quantity IS NOT NULL THEN
+      NEW.quantity          := NEW.original_quantity;
+      NEW.original_quantity := NULL;
+    END IF;
+    RETURN NEW;
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_zero_quantity_on_cancellation ON public.order_items;
+
+CREATE TRIGGER trg_zero_quantity_on_cancellation
+BEFORE UPDATE OF status_id ON public.order_items
+FOR EACH ROW
+EXECUTE FUNCTION private.fn_zero_quantity_on_cancellation();

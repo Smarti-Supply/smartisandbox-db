@@ -293,7 +293,7 @@ CREATE TABLE public.order_items (
     item_number BIGINT NOT NULL,                                   -- Número sequencial do item
     product TEXT NOT NULL CHECK (trim(product) <> ''),          -- Código ou nome do produto
     product_description TEXT NULL,                              -- Descrição do produto
-    quantity NUMERIC(12,2) NOT NULL CHECK (quantity > 0),       -- Quantidade mínima = 1
+    quantity NUMERIC(12,2) NOT NULL CHECK (quantity >= 0),      -- >= 0 permite zerar itens cancelados
     unity_of_measure TEXT NULL,                                 -- Unidade de medida (ex: "kg", "un", "m")
     unit_price NUMERIC(12,2) NOT NULL CHECK (unit_price >= 0),  -- Preço unitário mínimo = 0
     total_price NUMERIC(12,2) GENERATED ALWAYS AS (ROUND(quantity * unit_price, 2)) STORED,   -- Cálculo automático
@@ -302,6 +302,7 @@ CREATE TABLE public.order_items (
     current_delivery_date DATE NULL,                                                          -- Data de entrega atual, alterável
     deliver_time INT GENERATED ALWAYS AS (current_delivery_date - due_date) STORED,           -- Prazo de entrega calculado
     status_id INT NULL,                                                                       -- Status do item
+    original_quantity NUMERIC(12,2) DEFAULT NULL,                                             -- Preserva qty antes de cancelamento (status 12/13) para restauração
     created_at TIMESTAMP DEFAULT now() NOT NULL,
     FOREIGN KEY (order_id) REFERENCES public.orders(id) ON DELETE CASCADE,
     FOREIGN KEY (status_id) REFERENCES public.order_item_status(id) ON DELETE RESTRICT,
