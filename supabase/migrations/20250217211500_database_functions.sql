@@ -3315,7 +3315,10 @@ END;
 $$;
 
 -- Função para evitar duplicação de itens na fila para o mesmo fornecedor/regra.
--- Respeita repeat_interval_days para controlar frequência de envio
+-- Respeita repeat_interval_days para controlar frequência de envio.
+-- Com cooldown_per_order = TRUE, filtra p_order_ids mantendo apenas pedidos que
+-- ainda não foram notificados com sucesso na janela de cooldown (evita pular
+-- pedidos novos quando outro pedido do mesmo fornecedor já foi notificado hoje).
 CREATE OR REPLACE FUNCTION private.fn_queue_followup(
     p_setting_id BIGINT,
     p_supplier_id BIGINT,
@@ -3331,7 +3334,10 @@ DECLARE
     v_repeat_interval_days INT;
     v_cooldown_per_order BOOLEAN;
     v_last_success_at TIMESTAMP;
+    v_effective_order_ids BIGINT[];
+    v_has_new_orders BOOLEAN;
     v_should_queue BOOLEAN := FALSE;
+    v_cooldown_cutoff TIMESTAMP;
 BEGIN
     -- Buscar company_id, repeat_interval_days e cooldown_per_order do setting
     SELECT fs.company_id, fs.repeat_interval_days, fs.cooldown_per_order
@@ -3339,47 +3345,61 @@ BEGIN
     FROM public.followup_settings fs
     WHERE fs.id = p_setting_id;
 
-    -- Buscar último envio bem-sucedido: por pedidos ou por fornecedor conforme a flag
-    IF v_cooldown_per_order THEN
-        -- Cooldown por pedido: verificar se estes pedidos específicos já receberam
-        SELECT MAX(updated_at) INTO v_last_success_at
-        FROM private.followup_queue
-        WHERE setting_id = p_setting_id
-          AND order_ids && p_order_ids
-          AND status = 'sucesso';
+    -- Início da janela de cooldown
+    IF v_repeat_interval_days IS NULL OR v_repeat_interval_days = 0 THEN
+        v_cooldown_cutoff := CURRENT_DATE;
     ELSE
-        -- Cooldown por fornecedor (comportamento atual)
+        v_cooldown_cutoff := NOW() - (v_repeat_interval_days || ' days')::INTERVAL;
+    END IF;
+
+    IF v_cooldown_per_order THEN
+        -- Cooldown por pedido: manter apenas pedidos sem sucesso na janela
+        SELECT array_agg(candidate)
+        INTO v_effective_order_ids
+        FROM unnest(p_order_ids) AS candidate
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM private.followup_queue q
+            WHERE q.setting_id = p_setting_id
+              AND q.status = 'sucesso'
+              AND candidate = ANY(q.order_ids)
+              AND q.updated_at >= v_cooldown_cutoff
+        );
+
+        v_has_new_orders := v_effective_order_ids IS NOT NULL
+                            AND array_length(v_effective_order_ids, 1) > 0;
+
+        IF NOT v_has_new_orders THEN
+            RETURN;
+        END IF;
+
+        v_should_queue := TRUE;
+
+    ELSE
+        -- Cooldown por fornecedor: pular fornecedor se houve sucesso na janela
+        v_effective_order_ids := p_order_ids;
+
         SELECT MAX(updated_at) INTO v_last_success_at
         FROM private.followup_queue
         WHERE setting_id = p_setting_id
           AND supplier_id = p_supplier_id
           AND status = 'sucesso';
-    END IF;
 
-    -- Decidir se deve enfileirar baseado no repeat_interval_days
-    IF v_repeat_interval_days IS NULL OR v_repeat_interval_days = 0 THEN
-        -- Se repeat_interval_days é NULL ou 0, só envia 1x por dia
-        IF v_last_success_at IS NULL OR v_last_success_at < CURRENT_DATE THEN
-            v_should_queue := TRUE;
-        END IF;
-    ELSE
-        -- Se repeat_interval_days > 0, respeita o intervalo configurado
-        IF v_last_success_at IS NULL OR 
-           v_last_success_at < (NOW() - (v_repeat_interval_days || ' days')::INTERVAL) THEN
+        IF v_last_success_at IS NULL OR v_last_success_at < v_cooldown_cutoff THEN
             v_should_queue := TRUE;
         END IF;
     END IF;
 
-    -- Se deve enfileirar E não existe item pendente/enviando para estes pedidos, inserir
+    -- Inserir na fila se elegível e sem entrada pendente/enviando
     IF v_should_queue THEN
         INSERT INTO private.followup_queue (setting_id, supplier_id, company_id, order_ids, next_try_at)
-        SELECT p_setting_id, p_supplier_id, v_company_id, p_order_ids, NOW()
+        SELECT p_setting_id, p_supplier_id, v_company_id, v_effective_order_ids, NOW()
         WHERE NOT EXISTS (
             SELECT 1 FROM private.followup_queue q
             WHERE q.setting_id = p_setting_id
               AND q.supplier_id = p_supplier_id
               AND q.status IN ('pendente', 'enviando')
-              AND (NOT v_cooldown_per_order OR q.order_ids && p_order_ids)
+              AND (NOT v_cooldown_per_order OR q.order_ids && v_effective_order_ids)
         );
     END IF;
 END;
@@ -3610,6 +3630,31 @@ BEGIN
 
   FOR v_item IN SELECT setting_id, order_ids FROM private.followup_queue WHERE id = ANY(v_queue_ids) LOOP
     PERFORM private.fn_update_followup_counters(v_item.setting_id, v_item.order_ids);
+  END LOOP;
+
+  -- Inserir followup_logs no DB (não depender só da edge function em background)
+  FOR v_item IN SELECT value FROM jsonb_array_elements(v_payload) LOOP
+    INSERT INTO public.followup_logs (
+      company_id,
+      supplier_id,
+      supplier_contacts,
+      orders_payload,
+      sent_by,
+      user_observations,
+      setting_id,
+      status,
+      notification_type
+    ) VALUES (
+      (v_item.value ->> 'company_id')::BIGINT,
+      (v_item.value ->> 'supplier_id')::BIGINT,
+      ARRAY(SELECT jsonb_array_elements_text(v_item.value -> 'supplier_contacts')),
+      v_item.value -> 'orders_payload',
+      NULL,
+      NULLIF(v_item.value ->> 'user_observations', ''),
+      (v_item.value ->> 'setting_id')::BIGINT,
+      'enviado',
+      'email'
+    );
   END LOOP;
 
   v_success := array_length(v_queue_ids, 1);

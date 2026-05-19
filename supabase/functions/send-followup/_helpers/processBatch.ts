@@ -11,20 +11,18 @@ export async function processBatch(
   entries: Entry[],
   supabase: SupabaseClient,
 ) {
-    const batch: Array<{
-      from: string;
-      to: string[];
-      subject: string;
-      html: string;
-    }> = [];
-  
-    for (const entry of entries) {
-      for (const email of entry.supplier_contacts) {
-        const item = await generateLink(entry, email);
-        if (item) batch.push(item);
-      }
-    }
-  
+    // Generate all magic links concurrently — sequential awaits caused timeouts on
+    // large batches (30+ entries × ~500ms each = 15+ seconds before Resend call).
+    const linkResults = await Promise.all(
+      entries.flatMap((entry) =>
+        entry.supplier_contacts.map((email) => generateLink(entry, email))
+      ),
+    );
+
+    const batch = linkResults.filter(
+      (item): item is NonNullable<typeof item> => item !== null,
+    );
+
     if (batch.length === 0) {
       console.warn("Nenhum e-mail válido para envio no batch.");
       return;
