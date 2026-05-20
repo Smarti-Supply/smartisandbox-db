@@ -4465,3 +4465,191 @@ EXCEPTION
     RAISE;
 END;
 $$;
+
+-- ╭────────────────────────────────────────────────────────────────────╮
+-- ┃  Confirmation letter failure detection (OPS alert)                 ┃
+-- ╰────────────────────────────────────────────────────────────────────╯
+-- Detects orders whose items entered the confirmation-letter trigger
+-- status but never received a successful followup send.
+-- Recipients: OPS_ALERT_FROM (edge check-confirmation-failures)
+-- Dedup: private.process_logs (process_name = 'conf_letter_alert')
+-- Schedule: every 30 minutes via pg_cron (cron_settings.sql)
+--
+-- Returns orders that:
+--   (a) have at least one item in the trigger status for setting_id=1
+--   (b) were imported between p_max_age_hours and p_min_age_minutes ago
+--   (c) have NO followup_queue entry with status='sucesso' for setting_id
+--   (d) have NO followup_queue entry with status IN ('pendente','enviando')
+--   (e) supplier has at least one active contact
+--
+-- failure_reason:
+--   'exhausted_retries' – queue entry exists but tentativa >= max_tentativas
+--   'never_queued'      – no queue entry at all for this order
+
+CREATE OR REPLACE FUNCTION private.fn_detect_confirmation_letter_failures(
+  p_min_age_minutes INT     DEFAULT 30,
+  p_max_age_hours   INT     DEFAULT 48,
+  p_setting_id      BIGINT  DEFAULT 1
+)
+RETURNS TABLE (
+  order_id       BIGINT,
+  order_number   TEXT,
+  supplier_id    BIGINT,
+  supplier_name  TEXT,
+  imported_at    TIMESTAMP,
+  failure_reason TEXT
+)
+SECURITY DEFINER
+SET search_path TO 'public', 'private'
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_trigger_status_id  BIGINT;
+  v_company_id         BIGINT;
+  v_min_age_cutoff     TIMESTAMP;
+  v_max_age_cutoff     TIMESTAMP;
+BEGIN
+  SELECT fs.trigger_reference_id, fs.company_id
+  INTO   v_trigger_status_id, v_company_id
+  FROM   public.followup_settings fs
+  WHERE  fs.id = p_setting_id
+    AND  fs.is_active = TRUE;
+
+  IF v_company_id IS NULL THEN
+    RETURN;
+  END IF;
+
+  v_min_age_cutoff := NOW() - (p_min_age_minutes || ' minutes')::INTERVAL;
+  v_max_age_cutoff := NOW() - (p_max_age_hours   || ' hours')::INTERVAL;
+
+  RETURN QUERY
+  SELECT DISTINCT ON (o.id)
+    o.id             AS order_id,
+    o.order_number   AS order_number,
+    o.supplier_id,
+    s.name           AS supplier_name,
+    o.created_at     AS imported_at,
+    CASE
+      WHEN EXISTS (
+        SELECT 1
+        FROM   private.followup_queue fq
+        WHERE  fq.setting_id = p_setting_id
+          AND  fq.status     = 'falha'
+          AND  o.id          = ANY(fq.order_ids)
+          AND  fq.tentativa >= COALESCE(fq.max_tentativas, 3)
+      ) THEN 'exhausted_retries'
+      ELSE 'never_queued'
+    END AS failure_reason
+
+  FROM  public.orders o
+  JOIN  public.order_items         oi  ON oi.order_id  = o.id
+  JOIN  public.suppliers           s   ON s.id         = o.supplier_id
+  JOIN  public.default_order_status dos ON dos.id      = o.status_id
+
+  WHERE o.company_id = v_company_id
+
+    AND oi.status_id = v_trigger_status_id
+
+    AND EXISTS (
+      SELECT 1
+      FROM   public.order_items        oi2
+      JOIN   public.order_item_status  ois2 ON oi2.status_id = ois2.id
+      WHERE  oi2.order_id = o.id
+        AND  ois2.is_final = FALSE
+    )
+    AND (
+      (dos.is_final = FALSE AND dos.code != 'concluido')
+      OR dos.code = 'concluido'
+    )
+
+    AND EXISTS (
+      SELECT 1
+      FROM   public.supplier_contacts sc
+      WHERE  sc.supplier_id = o.supplier_id
+        AND  sc.is_active   = TRUE
+    )
+
+    AND o.created_at <= v_min_age_cutoff
+    AND o.created_at >= v_max_age_cutoff
+
+    AND NOT EXISTS (
+      SELECT 1
+      FROM   private.followup_queue fq
+      WHERE  fq.setting_id = p_setting_id
+        AND  fq.status     = 'sucesso'
+        AND  o.id          = ANY(fq.order_ids)
+    )
+
+    AND NOT EXISTS (
+      SELECT 1
+      FROM   private.followup_queue fq
+      WHERE  fq.setting_id = p_setting_id
+        AND  fq.status     IN ('pendente', 'enviando')
+        AND  o.id          = ANY(fq.order_ids)
+    )
+
+  ORDER BY o.id;
+END;
+$$;
+
+COMMENT ON FUNCTION private.fn_detect_confirmation_letter_failures(INT, INT, BIGINT) IS
+  'Returns orders imported within [p_max_age_hours, p_min_age_minutes] ago '
+  'whose confirmation letter (setting_id=1) was never successfully sent '
+  'and is not currently in-flight. Used by check-confirmation-failures edge function.';
+
+-- Mirrors fn_send_followup_batch_to_edge; called by pg_cron every 30 minutes.
+CREATE OR REPLACE FUNCTION private.fn_trigger_confirmation_letter_alert()
+RETURNS void
+SECURITY DEFINER
+SET search_path TO 'public', 'vault', 'private'
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_edge_token       TEXT;
+  v_service_role_key TEXT;
+  v_supabase_url     TEXT;
+  v_response         JSONB;
+  v_status           INT;
+BEGIN
+  SELECT decrypted_secret INTO v_edge_token
+  FROM   vault.decrypted_secrets
+  WHERE  name = 'INTERNAL_EDGE_TOKEN';
+
+  SELECT decrypted_secret INTO v_service_role_key
+  FROM   vault.decrypted_secrets
+  WHERE  name = 'SUPABASE_SERVICE_ROLE_KEY';
+
+  SELECT decrypted_secret INTO v_supabase_url
+  FROM   vault.decrypted_secrets
+  WHERE  name = 'SUPABASE_URL';
+
+  IF v_supabase_url IS NULL OR v_service_role_key IS NULL THEN
+    RAISE NOTICE 'fn_trigger_confirmation_letter_alert: missing vault secrets, skipping.';
+    RETURN;
+  END IF;
+
+  SELECT net.http_post(
+    url     := v_supabase_url || '/functions/v1/check-confirmation-failures',
+    headers := jsonb_build_object(
+      'Content-Type',  'application/json',
+      'Authorization', 'Bearer ' || v_service_role_key,
+      'edge-token',    COALESCE(v_edge_token, '')
+    ),
+    body    := '{}'::JSONB
+  ) INTO v_response;
+
+  v_status := (v_response ->> 'status')::INT;
+
+  IF v_status IS NOT NULL AND v_status >= 400 THEN
+    RAISE NOTICE 'fn_trigger_confirmation_letter_alert: edge error % — %',
+      v_status, v_response ->> 'body';
+  END IF;
+
+EXCEPTION WHEN OTHERS THEN
+  RAISE NOTICE 'fn_trigger_confirmation_letter_alert error: %', SQLERRM;
+END;
+$$;
+
+COMMENT ON FUNCTION private.fn_trigger_confirmation_letter_alert() IS
+  'Called by pg_cron every 30 minutes. Fires the check-confirmation-failures '
+  'edge function which detects missing confirmation letters and sends an OPS alert.';

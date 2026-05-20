@@ -70,3 +70,11 @@ SELECT cron.schedule(
   '0 5 * * *',  -- todos os dias às 5:00 da manhã (GMT)
   'SELECT * FROM private.fn_cleanup_followup_queue_with_alert();'
 );
+
+-- Alerta OPS: cartas de confirmação não enviadas após importação do pedido
+-- Offset :10/:40 UTC para rodar após o ciclo principal de follow-up
+SELECT cron.schedule(
+  'check-confirmation-letter-failures',
+  '10,40 * * * *',
+  'SELECT private.fn_trigger_confirmation_letter_alert();'
+);
