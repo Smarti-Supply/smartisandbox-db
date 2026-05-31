@@ -2,46 +2,64 @@
 -- ┃                            Views                                   ┃
 -- ╰────────────────────────────────────────────────────────────────────╯
 
--- Criar view para listar os dados de uso dos planos
+-- Criar view para listar os dados de uso dos planos.
+-- Refatorada em 2026-05-29 para usar CTEs pré-agregadas, eliminando o
+-- cross-join de ~48M linhas (orders × order_items × followup_logs) do shape
+-- anterior. Mesma assinatura de output, mesmo gate RLS (admin only).
 CREATE OR REPLACE VIEW public.view_client_usage
 WITH (security_invoker = true)
 AS
-SELECT
-    u.company_id,
-    c.plan_id,
-    DATE_TRUNC('month', NOW())::DATE AS period_start,
-    (DATE_TRUNC('month', NOW()) + INTERVAL '1 month' - INTERVAL '1 day')::DATE AS period_end,
-    COUNT(DISTINCT oi.id) AS total_order_lines,
+WITH
+period AS (
+  SELECT
+    DATE_TRUNC('month', NOW()) AS period_start_ts,
+    (DATE_TRUNC('month', NOW()) + INTERVAL '1 month') AS period_end_ts_exclusive
+),
+order_lines_month AS (
+  SELECT
+    o.company_id,
+    COUNT(*) AS total_order_lines
+  FROM public.orders o
+  JOIN public.order_items oi ON oi.order_id = o.id
+  CROSS JOIN period p
+  WHERE oi.created_at >= p.period_start_ts
+    AND oi.created_at < p.period_end_ts_exclusive
+  GROUP BY o.company_id
+),
+emails_month AS (
+  SELECT
+    fl.company_id,
     COALESCE(SUM(
-    CASE 
-        WHEN fl.supplier_contacts IS NOT NULL 
+      CASE
+        WHEN fl.supplier_contacts IS NOT NULL
         THEN cardinality(fl.supplier_contacts)
         ELSE 0
-    END
+      END
     ), 0) AS total_emails_sent
-FROM public.company_users u
-JOIN public.companies c ON c.id = u.company_id
-LEFT JOIN public.orders o 
-ON o.company_id = u.company_id
-AND o.created_at >= DATE_TRUNC('month', NOW())
-AND o.created_at < (DATE_TRUNC('month', NOW()) + INTERVAL '1 month')
-LEFT JOIN public.order_items oi 
-ON oi.order_id = o.id
-AND oi.created_at >= DATE_TRUNC('month', NOW())
-AND oi.created_at < (DATE_TRUNC('month', NOW()) + INTERVAL '1 month')
-LEFT JOIN public.followup_logs fl 
-ON fl.company_id = u.company_id
-AND fl.sent_at >= DATE_TRUNC('month', NOW())
-AND fl.sent_at < (DATE_TRUNC('month', NOW()) + INTERVAL '1 month')
+  FROM public.followup_logs fl
+  CROSS JOIN period p
+  WHERE fl.sent_at >= p.period_start_ts
+    AND fl.sent_at < p.period_end_ts_exclusive
+  GROUP BY fl.company_id
+)
+SELECT
+  c.id AS company_id,
+  c.plan_id,
+  (SELECT period_start_ts::date FROM period) AS period_start,
+  (SELECT (period_end_ts_exclusive - INTERVAL '1 day')::date FROM period) AS period_end,
+  COALESCE(ol.total_order_lines, 0) AS total_order_lines,
+  COALESCE(em.total_emails_sent, 0) AS total_emails_sent
+FROM public.companies c
+LEFT JOIN order_lines_month ol ON ol.company_id = c.id
+LEFT JOIN emails_month em ON em.company_id = c.id
 WHERE EXISTS (
-SELECT 1
-FROM private.user_access_cache uac
-WHERE uac.user_id = (select auth.uid())
+  SELECT 1
+  FROM private.user_access_cache uac
+  WHERE uac.user_id = (SELECT auth.uid())
     AND uac.role_name = 'admin'
     AND uac.is_active = true
-    AND uac.company_id = u.company_id
-)
-GROUP BY u.company_id, c.plan_id;
+    AND uac.company_id = c.id
+);
 
 
 -- Criar view para listar os pedidos dos clientes
@@ -172,10 +190,41 @@ LEFT JOIN LATERAL (
 ) n ON true;
 */
 
--- Criar view para listar as notificações dos pedidos
-CREATE OR REPLACE VIEW public.view_order_notifications 
-WITH (security_invoker = true) AS  -- ← E AQUI TAMBÉM
-SELECT * FROM public.fn_get_order_notifications();
+-- View de notificações dos pedidos (inline: permite predicate pushdown e índices;
+-- evita set-returning function que materializava toda a tabela por chamada).
+-- RLS: joins em company_users / supplier_users / supplier_contacts respeitam o invoker.
+CREATE OR REPLACE VIEW public.view_order_notifications
+WITH (security_invoker = true) AS
+SELECT
+    onf.id,
+    onf.order_id,
+    onf.order_item_id,
+    onf.type,
+    onf.message,
+    onf.is_read,
+    onf.created_at,
+    onf.read_by,
+    COALESCE(cu.name, sc.name) AS read_by_name,
+    COALESCE(cu.email, sc.email) AS read_by_email,
+    CASE
+        WHEN cu.id IS NOT NULL THEN 'client'::TEXT
+        WHEN su.id IS NOT NULL THEN 'supplier'::TEXT
+        ELSE NULL::TEXT
+    END AS read_by_user_type,
+    CASE
+        WHEN onf.type IN (
+            'client_observation',
+            'client_status_change',
+            'client_item_change'
+        ) THEN true
+        ELSE false
+    END AS is_from_client,
+    o.supplier_id
+FROM public.order_notifications onf
+LEFT JOIN public.orders o ON o.id = onf.order_id
+LEFT JOIN public.company_users cu ON cu.id = onf.read_by
+LEFT JOIN public.supplier_users su ON su.id = onf.read_by
+LEFT JOIN public.supplier_contacts sc ON sc.id = su.supplier_contact_id;
 
 
 -- Criar view para listar os registros de processo realizados por usuários
@@ -485,7 +534,11 @@ ORDER BY
     oii.nfe_date;
 
 
--- Criar view inteligente para visualizar logs de alterações dos pedidos
+-- Criar view inteligente para visualizar logs de alterações dos pedidos.
+-- Modificada em 2026-05-29: removido o ORDER BY interno (linha final) para
+-- permitir que predicados (WHERE order_id = X) façam pushdown dentro de cada
+-- branch do UNION ALL. Consumers devem aplicar ORDER BY created_at DESC
+-- explicitamente. fn_export_order_details já aplica via jsonb_agg ORDER BY.
 CREATE OR REPLACE VIEW public.view_order_change_logs
 WITH (security_invoker = true)
 AS
@@ -654,5 +707,5 @@ SELECT
 FROM combined_logs cl
 LEFT JOIN public.company_users cu ON cu.id = cl.changed_by_client
 LEFT JOIN public.supplier_contacts sc ON sc.id = cl.changed_by_supplier
-LEFT JOIN public.order_items oi ON oi.id = cl.order_item_id
-ORDER BY cl.created_at DESC;
+LEFT JOIN public.order_items oi ON oi.id = cl.order_item_id;
+-- NOTA: sem ORDER BY interno — habilita predicate pushdown nos UNION ALL.

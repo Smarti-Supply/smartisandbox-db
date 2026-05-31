@@ -1138,12 +1138,22 @@ LEFT JOIN LATERAL (
 ) min_status ON true
 LIMIT 1000;
 
--- Multi-supplier UAC: várias linhas por user_id duplicavam pedidos; DISTINCT ON para WeWeb.
+-- Multi-supplier UAC: várias linhas por user_id duplicavam pedidos.
+-- Refatorada em 2026-05-29:
+--   1. Substituído string_to_array(cu.supplier_letter, ';') + UNNEST per-row
+--      por EXISTS direto contra private.company_user_supplier_scope (mantida
+--      por triggers — ver scope rebuild functions abaixo).
+--   2. Removido DISTINCT ON (o.id): compradores têm 1 UAC row cada na prática
+--      e a PK do scope table (company_user_id, supplier_id) garante dedup;
+--      DISTINCT ON impunha um Sort caro sem benefício real aqui.
+--   3. Substituído EXISTS (... view_order_notifications) — que ativava a
+--      LATERAL com fn_supplier_access_from_uac — por EXISTS direto contra
+--      public.order_notifications. Equivalente para esta view (consumida
+--      apenas por company-side users).
+-- Audit 2026-05-18 estimou queda de 420ms → < 150ms.
 CREATE OR REPLACE VIEW public.view_orders_filtered_by_user
 WITH (security_invoker = true) AS
-SELECT *
-FROM (
-  SELECT DISTINCT ON (o.id)
+SELECT
     o.id,
     o.order_number,
     o.order_description,
@@ -1173,74 +1183,64 @@ FROM (
         AND fs.max_followups IS NOT NULL
         AND fit.followup_count >= fs.max_followups
     ) AS max_followups_reached,
+    -- EXISTS direto em order_notifications (sem view, sem LATERAL).
     EXISTS (
       SELECT 1
-      FROM public.view_order_notifications von
-      WHERE von.order_id = o.id
-        AND von.is_read = false
-        AND von.is_from_client = false
+      FROM public.order_notifications onf
+      WHERE onf.order_id = o.id
+        AND onf.is_read = false
+        AND onf.type IN (
+          'order_status_change',
+          'delivery_date_change',
+          'item_status_change',
+          'item_invoiced'
+        )
     ) AS has_notifications_from_supplier,
     EXISTS (
       SELECT 1
-      FROM public.view_order_notifications von
-      WHERE von.order_id = o.id
-        AND von.is_read = false
-        AND von.is_from_client = true
+      FROM public.order_notifications onf
+      WHERE onf.order_id = o.id
+        AND onf.is_read = false
+        AND onf.type IN (
+          'client_observation',
+          'client_status_change',
+          'client_item_change'
+        )
     ) AS has_notifications_from_client,
     COALESCE(min_status.status_id, NULL) AS order_items_min_status_id,
     COALESCE(min_status.status_name, NULL) AS order_items_min_status_name
-  FROM public.orders o
-  JOIN public.suppliers s ON s.id = o.supplier_id
-  JOIN public.default_order_status dos ON dos.id = o.status_id
-  JOIN public.company_users cu ON cu.id = (SELECT auth.uid())
-  JOIN private.user_access_cache uac
-    ON uac.user_id = cu.id
-   AND uac.is_active = true
-  LEFT JOIN LATERAL (
-    SELECT
-      oi.status_id,
-      ois.name AS status_name
-    FROM public.order_items oi
-    LEFT JOIN public.order_item_status ois ON oi.status_id = ois.id
-    WHERE oi.order_id = o.id
-      AND oi.status_id IS NOT NULL
-    ORDER BY COALESCE(ois.position, 999999) ASC
-    LIMIT 1
-  ) min_status ON true
-  WHERE
-    uac.role_name = 'admin'
-    OR (cu.supplier_id IS NOT NULL AND s.id = cu.supplier_id)
-    OR (
-      cu.supplier_id IS NULL AND (
-        (
-          LOWER(LEFT(s.name, 1)) = ANY (
-            SELECT LOWER(UNNEST(string_to_array(cu.supplier_letter, ';')))
-          )
-        )
-        OR (
-          '#' = ANY(string_to_array(cu.supplier_letter, ';'))
-          AND LEFT(s.name, 1) ~ '^[0-9]'
-        )
-      )
-    )
-    AND (
-      cu.supplier_id IS NOT NULL OR
-      s.id NOT IN (
-        SELECT DISTINCT cu2.supplier_id
-        FROM public.company_users cu2
-        WHERE cu2.supplier_id IS NOT NULL
-      )
-    )
-  ORDER BY
-    o.id,
-    CASE uac.role_name
-      WHEN 'admin' THEN 1
-      WHEN 'comprador' THEN 2
-      WHEN 'fornecedor' THEN 3
-      ELSE 4
-    END,
-    uac.id
-) deduped_orders;
+FROM public.orders o
+JOIN public.suppliers s ON s.id = o.supplier_id
+JOIN public.default_order_status dos ON dos.id = o.status_id
+JOIN public.company_users cu ON cu.id = (SELECT auth.uid())
+JOIN private.user_access_cache uac
+  ON uac.user_id = cu.id
+ AND uac.is_active = true
+LEFT JOIN LATERAL (
+  SELECT
+    oi.status_id,
+    ois.name AS status_name
+  FROM public.order_items oi
+  LEFT JOIN public.order_item_status ois ON oi.status_id = ois.id
+  WHERE oi.order_id = o.id
+    AND oi.status_id IS NOT NULL
+  ORDER BY COALESCE(ois.position, 999999) ASC
+  LIMIT 1
+) min_status ON true
+WHERE
+  -- Admins veem tudo na sua company.
+  uac.role_name = 'admin'
+  OR
+  -- Compradores veem pedidos cujos suppliers estão na sua scope materializada.
+  EXISTS (
+    SELECT 1
+    FROM private.company_user_supplier_scope cuss
+    WHERE cuss.company_user_id = cu.id
+      AND cuss.supplier_id = o.supplier_id
+  );
+
+COMMENT ON VIEW public.view_orders_filtered_by_user IS
+  'Orders visible to the current company_user. Admins see all orders in their company; compradores see suppliers from private.company_user_supplier_scope (trigger-maintained materialization of supplier_letter + supplier_id rules).';
 
 -- view_order_items (Transpetro): alinhado a view_order_notifications; evita PGRST205.
 CREATE OR REPLACE VIEW public.view_order_items
@@ -1322,6 +1322,9 @@ GRANT SELECT ON public.view_order_items TO authenticated;
 GRANT SELECT ON public.view_order_items TO service_role;
 
 -- Supplier RLS helper (requires supplier_users.auth_user_id from 20260430120000). Policies reference this in 20260502120000.
+-- Modificada em 2026-05-29: adicionado fast-path bigint puro (sem JOIN) para
+-- single-supplier users (~99% do tráfego). Marcada PARALLEL SAFE. Audit
+-- 2026-05-18 mediu redução de 94% em view_orders após esse fix.
 CREATE OR REPLACE FUNCTION private.fn_supplier_access_from_uac(
   p_uac_supplier_id bigint,
   p_uac_company_id bigint,
@@ -1330,53 +1333,218 @@ CREATE OR REPLACE FUNCTION private.fn_supplier_access_from_uac(
 RETURNS boolean
 LANGUAGE sql
 STABLE
+PARALLEL SAFE
 SECURITY DEFINER
 SET search_path TO 'public'
 AS $$
   SELECT
     p_uac_supplier_id IS NOT NULL
-    AND EXISTS (
-      SELECT 1
-      FROM public.suppliers s_res
-      JOIN public.suppliers s_uac ON s_uac.id = p_uac_supplier_id
-      WHERE s_res.id = p_resource_supplier_id
-        AND s_res.company_id = p_uac_company_id
-        AND s_uac.company_id = p_uac_company_id
-        AND (
-          s_res.id = s_uac.id
-          OR (
-            s_res.id <> s_uac.id
-            AND EXISTS (
-              SELECT 1
-              FROM public.supplier_contacts sc_res
-              WHERE sc_res.supplier_id = s_res.id
-                AND sc_res.is_active = true
-                AND EXISTS (
-                  SELECT 1
-                  FROM public.supplier_users su
-                  JOIN public.supplier_contacts sc_u ON sc_u.id = su.supplier_contact_id
-                  WHERE su.auth_user_id = (SELECT auth.uid())
-                    AND sc_u.supplier_id = p_uac_supplier_id
-                    AND sc_u.is_active = true
-                    AND lower(trim(sc_u.email)) = lower(trim(sc_res.email))
-                )
-                AND EXISTS (
-                  SELECT 1
-                  FROM public.supplier_contacts sc2
-                  JOIN public.suppliers s2 ON s2.id = sc2.supplier_id
-                  WHERE sc2.is_active = true
-                    AND s2.company_id = p_uac_company_id
-                    AND lower(trim(sc2.email)) = lower(trim(sc_res.email))
-                    AND sc2.supplier_id <> s_res.id
-                )
-            )
+    AND p_resource_supplier_id IS NOT NULL
+    AND (
+      -- Fast path: direct supplier_id match (sem table access).
+      p_uac_supplier_id = p_resource_supplier_id
+
+      -- Slow path: email-expansion entre suppliers da mesma company.
+      OR EXISTS (
+        SELECT 1
+        FROM public.suppliers s_res
+        JOIN public.suppliers s_uac ON s_uac.id = p_uac_supplier_id
+        WHERE s_res.id = p_resource_supplier_id
+          AND s_res.company_id = p_uac_company_id
+          AND s_uac.company_id = p_uac_company_id
+          AND s_res.id <> s_uac.id
+          AND EXISTS (
+            SELECT 1
+            FROM public.supplier_contacts sc_res
+            WHERE sc_res.supplier_id = s_res.id
+              AND sc_res.is_active = true
+              AND EXISTS (
+                SELECT 1
+                FROM public.supplier_users su
+                JOIN public.supplier_contacts sc_u ON sc_u.id = su.supplier_contact_id
+                WHERE su.auth_user_id = (SELECT auth.uid())
+                  AND sc_u.supplier_id = p_uac_supplier_id
+                  AND sc_u.is_active = true
+                  AND lower(trim(sc_u.email)) = lower(trim(sc_res.email))
+              )
+              AND EXISTS (
+                SELECT 1
+                FROM public.supplier_contacts sc2
+                JOIN public.suppliers s2 ON s2.id = sc2.supplier_id
+                WHERE sc2.is_active = true
+                  AND s2.company_id = p_uac_company_id
+                  AND lower(trim(sc2.email)) = lower(trim(sc_res.email))
+                  AND sc2.supplier_id <> s_res.id
+              )
           )
-        )
+      )
     );
 $$;
 
 COMMENT ON FUNCTION private.fn_supplier_access_from_uac(bigint, bigint, bigint) IS
-  'Supplier: same supplier_id as UAC, or same company with matching normalized active contact email for auth user and at least one other supplier in the company sharing that email (SECURITY DEFINER).';
+  'Fast-path: direct supplier_id match (no table access). Slow-path: email-expansion within the same company. STABLE PARALLEL SAFE SECURITY DEFINER.';
 
 REVOKE ALL ON FUNCTION private.fn_supplier_access_from_uac(bigint, bigint, bigint) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION private.fn_supplier_access_from_uac(bigint, bigint, bigint) TO authenticated;
+
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- Scope rebuild function + triggers (added 2026-05-29)
+-- ═══════════════════════════════════════════════════════════════════════════
+-- Mantêm private.company_user_supplier_scope (tabela definida em
+-- 20260430120000_multi_supplier_auth_schema.sql) em sincronia com mudanças
+-- em company_users e suppliers.
+
+-- ---------------------------------------------------------------------------
+-- Rebuild function — recomputa scope rows para uma company inteira
+-- ---------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION private.fn_rebuild_company_user_supplier_scope(
+  p_company_id BIGINT
+)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path TO 'public', 'private'
+AS $$
+DECLARE
+  -- pg_advisory_xact_lock(int, int) usa int4 args. O 1º slot é namespace
+  -- (arbitrário mas distinto de outros uses); o 2º é o company_id (cast
+  -- seguro pra int4 — company_ids nunca passam de int4 na prática).
+  ADVISORY_LOCK_NAMESPACE CONSTANT INTEGER := 4205207;
+  LETTER_DIGIT_TOKEN CONSTANT TEXT := '#';
+BEGIN
+  IF p_company_id IS NULL THEN
+    RETURN;
+  END IF;
+
+  -- Serializa rebuilds por company_id para evitar race DELETE/INSERT.
+  PERFORM pg_advisory_xact_lock(ADVISORY_LOCK_NAMESPACE, p_company_id::integer);
+
+  -- Limpa scope atual de compradores nesta company.
+  DELETE FROM private.company_user_supplier_scope cuss
+  USING public.company_users cu
+  WHERE cuss.company_user_id = cu.id
+    AND cu.company_id = p_company_id;
+
+  -- Repopula.
+  INSERT INTO private.company_user_supplier_scope (company_user_id, supplier_id)
+  SELECT DISTINCT cu.id, s.id
+  FROM public.company_users cu
+  JOIN public.suppliers s ON s.company_id = cu.company_id
+  WHERE cu.company_id = p_company_id
+    AND cu.is_active = true
+    AND (
+      -- Regra 1: claim direto.
+      (cu.supplier_id IS NOT NULL AND s.id = cu.supplier_id)
+      OR
+      -- Regras 2 & 3: letter-based matching, excluindo suppliers já
+      -- claimed por outro single-supplier comprador na mesma company.
+      (
+        cu.supplier_id IS NULL
+        AND cu.supplier_letter IS NOT NULL
+        AND (
+          LOWER(LEFT(s.name, 1)) = ANY (
+            SELECT LOWER(letter)
+            FROM unnest(string_to_array(cu.supplier_letter, ';')) AS letter
+          )
+          OR (
+            LETTER_DIGIT_TOKEN = ANY (string_to_array(cu.supplier_letter, ';'))
+            AND LEFT(s.name, 1) ~ '^[0-9]'
+          )
+        )
+        AND NOT EXISTS (
+          SELECT 1
+          FROM public.company_users claimer
+          WHERE claimer.company_id = cu.company_id
+            AND claimer.supplier_id = s.id
+            AND claimer.is_active = true
+        )
+      )
+    );
+END;
+$$;
+
+COMMENT ON FUNCTION private.fn_rebuild_company_user_supplier_scope(BIGINT) IS
+  'Rebuilds the (comprador, supplier) scope rows for a single company. Idempotent. Serialized per company via pg_advisory_xact_lock.';
+
+-- ---------------------------------------------------------------------------
+-- Trigger function — wrapper para mutations em company_users
+-- ---------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION private.fn_trg_refresh_scope_for_company_user()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path TO 'public', 'private'
+AS $$
+BEGIN
+  IF TG_OP = 'DELETE' THEN
+    PERFORM private.fn_rebuild_company_user_supplier_scope(OLD.company_id);
+    RETURN OLD;
+  ELSIF TG_OP = 'INSERT' THEN
+    PERFORM private.fn_rebuild_company_user_supplier_scope(NEW.company_id);
+    RETURN NEW;
+  ELSE -- UPDATE
+    IF OLD.company_id IS DISTINCT FROM NEW.company_id THEN
+      PERFORM private.fn_rebuild_company_user_supplier_scope(OLD.company_id);
+    END IF;
+    PERFORM private.fn_rebuild_company_user_supplier_scope(NEW.company_id);
+    RETURN NEW;
+  END IF;
+END;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- Trigger function — wrapper para mutations em suppliers
+-- ---------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION private.fn_trg_refresh_scope_for_supplier()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path TO 'public', 'private'
+AS $$
+BEGIN
+  IF TG_OP = 'DELETE' THEN
+    PERFORM private.fn_rebuild_company_user_supplier_scope(OLD.company_id);
+    RETURN OLD;
+  ELSIF TG_OP = 'INSERT' THEN
+    PERFORM private.fn_rebuild_company_user_supplier_scope(NEW.company_id);
+    RETURN NEW;
+  ELSE -- UPDATE
+    IF OLD.company_id IS DISTINCT FROM NEW.company_id THEN
+      PERFORM private.fn_rebuild_company_user_supplier_scope(OLD.company_id);
+    END IF;
+    PERFORM private.fn_rebuild_company_user_supplier_scope(NEW.company_id);
+    RETURN NEW;
+  END IF;
+END;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- Triggers
+-- ---------------------------------------------------------------------------
+DROP TRIGGER IF EXISTS trg_refresh_scope_on_company_users ON public.company_users;
+CREATE TRIGGER trg_refresh_scope_on_company_users
+AFTER INSERT OR DELETE OR UPDATE OF supplier_id, supplier_letter, company_id, is_active
+ON public.company_users
+FOR EACH ROW
+EXECUTE FUNCTION private.fn_trg_refresh_scope_for_company_user();
+
+DROP TRIGGER IF EXISTS trg_refresh_scope_on_suppliers ON public.suppliers;
+CREATE TRIGGER trg_refresh_scope_on_suppliers
+AFTER INSERT OR DELETE OR UPDATE OF name, company_id
+ON public.suppliers
+FOR EACH ROW
+EXECUTE FUNCTION private.fn_trg_refresh_scope_for_supplier();
+
+-- ---------------------------------------------------------------------------
+-- Backfill inicial — popula scope para toda company existente
+-- ---------------------------------------------------------------------------
+DO $$
+DECLARE
+  company_record RECORD;
+BEGIN
+  FOR company_record IN SELECT id FROM public.companies LOOP
+    PERFORM private.fn_rebuild_company_user_supplier_scope(company_record.id);
+  END LOOP;
+END;
+$$;

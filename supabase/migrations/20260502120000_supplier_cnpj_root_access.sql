@@ -1000,6 +1000,14 @@ AS $$
 $$;
 
 -- Export (utilizador empresa): todas as faturas/observações do pedido no JSON; join sc só para nome quando created_by é fornecedor daquele supplier.
+-- Modificada em 2026-05-29 (Fixes 2.3 + 2.4):
+--   2.3 — net.http_post agora é fire-and-forget (PERFORM ao invés de SELECT
+--         INTO). A edge function /functions/v1/export-order-details é
+--         responsável por logar próprio sucesso/erro em private.process_logs
+--         via public.fn_log_edge_process_event. Reduz max latency da RPC
+--         de 1.4s pra < 100ms.
+--   2.4 — Lookup em followup_logs usa @> com idx_followup_logs_orders_payload_path
+--         (GIN). Substituiu jsonb_array_elements + cast (que fazia full scan).
 CREATE OR REPLACE FUNCTION public.fn_export_order_details(
   p_order_id BIGINT,
   p_user_id UUID
@@ -1023,10 +1031,8 @@ DECLARE
   followup_logs_data JSONB;
   order_item_invoices_data JSONB;
   order_change_logs_data JSONB;
-  combined_data JSONB;
   payload JSONB;
   export_id UUID;
-  v_response JSONB;
 BEGIN
   SELECT cu.email, cu.company_id
   INTO user_email, v_company_id
@@ -1176,11 +1182,11 @@ BEGIN
   LEFT JOIN public.followup_settings fs ON fs.id = fl.setting_id
   LEFT JOIN public.company_users sent_cu ON sent_cu.id = fl.sent_by
   WHERE fl.company_id = v_company_id
-    AND EXISTS (
-      SELECT 1
-      FROM jsonb_array_elements(fl.orders_payload) AS order_entry
-      WHERE (order_entry->>'order_id')::BIGINT = p_order_id
-    );
+    -- Fix 2.4: usa idx_followup_logs_orders_payload_path (GIN jsonb_path_ops)
+    -- via @>. Substituiu jsonb_array_elements + cast que fazia full scan.
+    AND fl.orders_payload @> jsonb_build_array(
+          jsonb_build_object('order_id', p_order_id)
+        );
 
   SELECT COALESCE(jsonb_agg(
     jsonb_build_object(
@@ -1225,12 +1231,6 @@ BEGIN
   FROM public.view_order_change_logs
   WHERE order_id = p_order_id;
 
-  combined_data := jsonb_build_object(
-    'id_pedido', p_order_id,
-    'observations', observations_data,
-    'followup_tracking', followup_tracking_data
-  );
-
   export_id := gen_random_uuid();
 
   SELECT decrypted_secret INTO service_role_key
@@ -1260,8 +1260,12 @@ BEGIN
     'user_email', user_email
   );
 
+  -- Fix 2.3: Fire-and-forget dispatch. A RPC retorna assim que a request é
+  -- enfileirada no pg_net. A edge function loga seu próprio sucesso/erro em
+  -- private.process_logs via public.fn_log_edge_process_event (keyed by
+  -- export_id pra polling do cliente).
   BEGIN
-    SELECT net.http_post(
+    PERFORM net.http_post(
       url := supabase_url || '/functions/v1/export-order-details',
       headers := jsonb_build_object(
         'Content-Type', 'application/json',
@@ -1269,51 +1273,34 @@ BEGIN
         'edge-token', edge_token
       ),
       body := payload
-    ) INTO v_response;
+    );
 
-    IF (v_response ->> 'status')::INT >= 400 THEN
-      PERFORM private.fn_log_process_event(
-        p_process_name := 'data_export',
-        p_function_name := 'fn_export_order_details',
-        p_step := 'edge_function_call',
-        p_status := 'error',
-        p_message := format('Erro na edge function: %s', v_response ->> 'content'),
-        p_user_id := p_user_id,
-        p_metadata := jsonb_build_object(
-          'export_id', export_id,
-          'id_pedido', p_order_id,
-          'response', v_response
-        )
-      );
-
-      RAISE EXCEPTION 'Erro na edge function: %', v_response ->> 'content';
-    ELSE
-      PERFORM private.fn_log_process_event(
-        p_process_name := 'data_export',
-        p_function_name := 'fn_export_order_details',
-        p_step := 'edge_function_call',
-        p_status := 'success',
-        p_message := format('Exportação iniciada com sucesso para pedido %s', p_order_id),
-        p_user_id := p_user_id,
-        p_metadata := jsonb_build_object(
-          'export_id', export_id,
-          'id_pedido', p_order_id,
-          'order_items_count', jsonb_array_length(order_items_data),
-          'observations_count', jsonb_array_length(observations_data),
-          'followup_tracking_count', jsonb_array_length(followup_tracking_data),
-          'followup_logs_count', jsonb_array_length(COALESCE(followup_logs_data, '[]'::jsonb)),
-          'response', v_response
-        )
-      );
-    END IF;
-
-  EXCEPTION WHEN OTHERS THEN
     PERFORM private.fn_log_process_event(
       p_process_name := 'data_export',
       p_function_name := 'fn_export_order_details',
-      p_step := 'edge_function_call',
+      p_step := 'edge_function_dispatched',
+      p_status := 'info',
+      p_message := format('Exportação enfileirada para pedido %s', p_order_id),
+      p_user_id := p_user_id,
+      p_metadata := jsonb_build_object(
+        'export_id', export_id,
+        'id_pedido', p_order_id,
+        'order_items_count', jsonb_array_length(order_items_data),
+        'observations_count', jsonb_array_length(observations_data),
+        'followup_tracking_count', jsonb_array_length(followup_tracking_data),
+        'followup_logs_count', jsonb_array_length(COALESCE(followup_logs_data, '[]'::jsonb))
+      )
+    );
+  EXCEPTION WHEN OTHERS THEN
+    -- Captura apenas falhas no dispatch (fila do pg_net cheia, erro lendo
+    -- vault, etc.). Erros de execução da edge function são logados pela
+    -- própria edge function.
+    PERFORM private.fn_log_process_event(
+      p_process_name := 'data_export',
+      p_function_name := 'fn_export_order_details',
+      p_step := 'edge_function_dispatch_failed',
       p_status := 'error',
-      p_message := format('Erro ao chamar edge function: %s', SQLERRM),
+      p_message := format('Erro ao enfileirar exportação: %s', SQLERRM),
       p_user_id := p_user_id,
       p_metadata := jsonb_build_object(
         'export_id', export_id,
@@ -1334,7 +1321,7 @@ BEGIN
     'followup_tracking_count', jsonb_array_length(followup_tracking_data),
     'followup_logs_count', jsonb_array_length(COALESCE(followup_logs_data, '[]'::jsonb)),
     'order_item_invoices_count', jsonb_array_length(COALESCE(order_item_invoices_data, '[]'::jsonb)),
-    'message', 'Exportação iniciada com sucesso'
+    'message', 'Exportação enfileirada com sucesso'
   );
 END;
 $$;

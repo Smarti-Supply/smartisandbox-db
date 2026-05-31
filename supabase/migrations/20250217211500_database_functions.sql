@@ -3230,6 +3230,9 @@ END;
 $$;
 
 -- Função executada pelo cron, para identificar regras elegíveis e popula a fila respeitando frequências.
+-- Modificada em 2026-05-29: UPDATE em followup_settings.last_sent_at agora é
+-- CONDICIONAL (só executa quando a regra efetivamente enfileirou ao menos um
+-- item). Antes, gerava ~44k UPDATEs/dia desnecessários em uma tabela de 7 linhas.
 CREATE OR REPLACE FUNCTION private.fn_execute_scheduled_followups()
 RETURNS TABLE (
   processed_rules INT,
@@ -3246,69 +3249,76 @@ DECLARE
   v_processed_rules INT := 0;
   v_queued_items INT := 0;
   v_skipped_rules INT := 0;
+  v_rule_queued_count INT := 0;
 BEGIN
   FOR setting IN
-      SELECT fs.*, c.name as company_name
+      SELECT fs.*, c.name AS company_name
       FROM public.followup_settings fs
       JOIN public.companies c ON c.id = fs.company_id
       WHERE fs.is_active = true
       ORDER BY fs.company_id, fs.id
   LOOP
-      
-      -- Verificar se passou o intervalo mínimo desde o último envio
-      -- IMPORTANTE: NÃO aplicar para trigger_scopes baseados em datas,
-      -- pois send_days_interval define a janela de datas, não a frequência.
-      -- Para esses casos, a frequência é controlada por repeat_interval_days na fn_queue_followup.
+
+      -- Skip rule if the minimum interval since last_sent_at has not elapsed.
+      -- Date-driven trigger scopes use repeat_interval_days inside fn_queue_followup
+      -- to throttle, so they bypass this guard.
       IF setting.trigger_scope NOT IN ('order_due_date', 'item_due_date', 'item_delivery_date')
-         AND setting.last_sent_at IS NOT NULL 
-         AND setting.send_days_interval IS NOT NULL 
+         AND setting.last_sent_at IS NOT NULL
+         AND setting.send_days_interval IS NOT NULL
          AND setting.send_days_interval > 0
          AND setting.last_sent_at > (NOW() - (setting.send_days_interval || ' days')::INTERVAL) THEN
-          -- Pular esta regra pois ainda não passou o intervalo mínimo
           v_skipped_rules := v_skipped_rules + 1;
           CONTINUE;
       END IF;
-      
-      -- Processar cada trigger_scope com suas funções específicas
-        IF setting.trigger_scope = 'default_order_status' THEN
-            FOR target IN SELECT * FROM private.fn_get_targets_default_order_status(setting.id) LOOP
-                PERFORM private.fn_queue_followup(setting.id, target.supplier_id, target.order_ids);
-                v_queued_items := v_queued_items + 1;
-            END LOOP;
 
-        ELSIF setting.trigger_scope = 'order_due_date' THEN
-            FOR target IN SELECT * FROM private.fn_get_targets_order_due_date(setting.id) LOOP
-                PERFORM private.fn_queue_followup(setting.id, target.supplier_id, target.order_ids);
-                v_queued_items := v_queued_items + 1;
-            END LOOP;
+      -- Reset per-rule counter so we know whether THIS rule queued anything.
+      v_rule_queued_count := 0;
 
-        ELSIF setting.trigger_scope = 'item_status' THEN
-            FOR target IN SELECT * FROM private.fn_get_targets_item_status(setting.id) LOOP
-                PERFORM private.fn_queue_followup(setting.id, target.supplier_id, target.order_ids);
-                v_queued_items := v_queued_items + 1;
-            END LOOP;
+      IF setting.trigger_scope = 'default_order_status' THEN
+          FOR target IN SELECT * FROM private.fn_get_targets_default_order_status(setting.id) LOOP
+              PERFORM private.fn_queue_followup(setting.id, target.supplier_id, target.order_ids);
+              v_queued_items := v_queued_items + 1;
+              v_rule_queued_count := v_rule_queued_count + 1;
+          END LOOP;
 
-        ELSIF setting.trigger_scope = 'item_due_date' THEN
-            FOR target IN SELECT * FROM private.fn_get_targets_item_due_date(setting.id) LOOP
-                PERFORM private.fn_queue_followup(setting.id, target.supplier_id, target.order_ids);
-                v_queued_items := v_queued_items + 1;
-            END LOOP;
+      ELSIF setting.trigger_scope = 'order_due_date' THEN
+          FOR target IN SELECT * FROM private.fn_get_targets_order_due_date(setting.id) LOOP
+              PERFORM private.fn_queue_followup(setting.id, target.supplier_id, target.order_ids);
+              v_queued_items := v_queued_items + 1;
+              v_rule_queued_count := v_rule_queued_count + 1;
+          END LOOP;
 
-        ELSIF setting.trigger_scope = 'item_delivery_date' THEN
-            FOR target IN SELECT * FROM private.fn_get_targets_item_delivery_date(setting.id) LOOP
-                PERFORM private.fn_queue_followup(setting.id, target.supplier_id, target.order_ids);
-                v_queued_items := v_queued_items + 1;
-            END LOOP;
-        END IF;
+      ELSIF setting.trigger_scope = 'item_status' THEN
+          FOR target IN SELECT * FROM private.fn_get_targets_item_status(setting.id) LOOP
+              PERFORM private.fn_queue_followup(setting.id, target.supplier_id, target.order_ids);
+              v_queued_items := v_queued_items + 1;
+              v_rule_queued_count := v_rule_queued_count + 1;
+          END LOOP;
 
-      -- Atualizar timestamp da última execução
-      UPDATE public.followup_settings
-      SET last_sent_at = NOW()
-      WHERE id = setting.id;
-    
+      ELSIF setting.trigger_scope = 'item_due_date' THEN
+          FOR target IN SELECT * FROM private.fn_get_targets_item_due_date(setting.id) LOOP
+              PERFORM private.fn_queue_followup(setting.id, target.supplier_id, target.order_ids);
+              v_queued_items := v_queued_items + 1;
+              v_rule_queued_count := v_rule_queued_count + 1;
+          END LOOP;
+
+      ELSIF setting.trigger_scope = 'item_delivery_date' THEN
+          FOR target IN SELECT * FROM private.fn_get_targets_item_delivery_date(setting.id) LOOP
+              PERFORM private.fn_queue_followup(setting.id, target.supplier_id, target.order_ids);
+              v_queued_items := v_queued_items + 1;
+              v_rule_queued_count := v_rule_queued_count + 1;
+          END LOOP;
+      END IF;
+
+      -- Only advance last_sent_at when this rule actually queued something.
+      IF v_rule_queued_count > 0 THEN
+          UPDATE public.followup_settings
+          SET last_sent_at = NOW()
+          WHERE id = setting.id;
+      END IF;
+
       v_processed_rules := v_processed_rules + 1;
   END LOOP;
-
 
   RETURN QUERY SELECT v_processed_rules, v_queued_items, v_skipped_rules;
 END;
@@ -4653,3 +4663,53 @@ $$;
 COMMENT ON FUNCTION private.fn_trigger_confirmation_letter_alert() IS
   'Called by pg_cron every 30 minutes. Fires the check-confirmation-failures '
   'edge function which detects missing confirmation letters and sends an OPS alert.';
+
+
+-- ╭────────────────────────────────────────────────────────────────────╮
+-- ┃  Edge function audit log wrapper (added 2026-05-29)                ┃
+-- ╰────────────────────────────────────────────────────────────────────╯
+-- Edge functions (export-order-details, export-data) cannot write directly to
+-- private.process_logs via supabase-js (.from("private.process_logs") resolves
+-- to a literal table name in the default schema and silently 404s). The
+-- wrapper below is callable from edge functions via supabase.rpc(...) and
+-- delegates to private.fn_log_process_event under SECURITY DEFINER.
+--
+-- Security model: granted to service_role only (edge functions authenticate
+-- with service_role key). Revoked from anon/authenticated so frontend cannot
+-- plant log entries.
+CREATE OR REPLACE FUNCTION public.fn_log_edge_process_event(
+  p_process_name TEXT,
+  p_function_name TEXT,
+  p_step TEXT,
+  p_status TEXT,
+  p_message TEXT,
+  p_user_id UUID DEFAULT NULL,
+  p_metadata JSONB DEFAULT NULL,
+  p_order_id BIGINT DEFAULT NULL
+)
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path TO 'public', 'private'
+AS $$
+BEGIN
+  PERFORM private.fn_log_process_event(
+    p_process_name  := p_process_name,
+    p_function_name := p_function_name,
+    p_step          := p_step,
+    p_status        := p_status,
+    p_message       := p_message,
+    p_user_id       := p_user_id,
+    p_metadata      := p_metadata,
+    p_order_id      := p_order_id
+  );
+END;
+$$;
+
+COMMENT ON FUNCTION public.fn_log_edge_process_event(TEXT, TEXT, TEXT, TEXT, TEXT, UUID, JSONB, BIGINT) IS
+  'Edge-function-callable wrapper around private.fn_log_process_event. Grants service_role the ability to log to private.process_logs without exposing the private schema via PostgREST.';
+
+REVOKE ALL ON FUNCTION public.fn_log_edge_process_event(TEXT, TEXT, TEXT, TEXT, TEXT, UUID, JSONB, BIGINT) FROM PUBLIC;
+REVOKE ALL ON FUNCTION public.fn_log_edge_process_event(TEXT, TEXT, TEXT, TEXT, TEXT, UUID, JSONB, BIGINT) FROM authenticated;
+REVOKE ALL ON FUNCTION public.fn_log_edge_process_event(TEXT, TEXT, TEXT, TEXT, TEXT, UUID, JSONB, BIGINT) FROM anon;
+GRANT EXECUTE ON FUNCTION public.fn_log_edge_process_event(TEXT, TEXT, TEXT, TEXT, TEXT, UUID, JSONB, BIGINT) TO service_role;

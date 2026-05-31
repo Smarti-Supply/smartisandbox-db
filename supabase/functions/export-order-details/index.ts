@@ -81,23 +81,39 @@ Deno.serve(async (req) => {
     await sendEmail(userEmail, pdfBytes, tableName, orderNumber);
     console.log("✅ Email enviado com sucesso");
 
-    await supabase.from("private.process_logs").insert({
-      process_name: "data_export",
-      function_name: "export-order-details",
-      step: "export_complete",
-      status: "success",
-      message: `Exportação processada com sucesso para pedido ${orderId}`,
-      user_id: p.user_id,
-      order_id: orderId,
-      metadata: {
-        export_id: p.export_id,
-        order_items_count: orderItems.length,
-        observations_count: observations.length,
-        followup_tracking_count: followupTracking.length,
-        followup_logs_count: followupLogs.length,
-        order_item_invoices_count: orderItemInvoices.length,
-      },
-    });
+    // Log success via public RPC wrapper. supabase-js cannot directly write to
+    // the `private` schema via `.from("private.process_logs")` — that resolves
+    // to a literal table name in the default schema and silently 404s. The
+    // wrapper public.fn_log_edge_process_event (migration 20260520121000)
+    // delegates to private.fn_log_process_event under SECURITY DEFINER.
+    const { error: successLogError } = await supabase.rpc(
+      "fn_log_edge_process_event",
+      {
+        p_process_name: "data_export",
+        p_function_name: "export-order-details",
+        p_step: "export_complete",
+        p_status: "success",
+        p_message: `Exportação processada com sucesso para pedido ${orderId}`,
+        p_user_id: p.user_id,
+        p_order_id: orderId,
+        p_metadata: {
+          export_id: p.export_id,
+          order_items_count: orderItems.length,
+          observations_count: observations.length,
+          followup_tracking_count: followupTracking.length,
+          followup_logs_count: followupLogs.length,
+          order_item_invoices_count: orderItemInvoices.length,
+        },
+      }
+    );
+    if (successLogError) {
+      // Don't fail the export — the email already went out. Just surface
+      // the log failure in edge logs so we can fix the audit trail later.
+      console.error(
+        "⚠️ Falha ao registrar log de sucesso:",
+        successLogError.message
+      );
+    }
 
     const response: ExportResponse = {
       success: true,
@@ -124,16 +140,23 @@ Deno.serve(async (req) => {
         Deno.env.get("SUPABASE_URL") ?? "",
         Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") ?? ""
       );
-      await supabase.from("private.process_logs").insert({
-        process_name: "data_export",
-        function_name: "export-order-details",
-        step: "error",
-        status: "error",
-        message,
-        user_id: null,
-        order_id: null,
-        metadata: { error: message },
-      });
+      const { error: errorLogError } = await supabase.rpc(
+        "fn_log_edge_process_event",
+        {
+          p_process_name: "data_export",
+          p_function_name: "export-order-details",
+          p_step: "error",
+          p_status: "error",
+          p_message: message,
+          p_user_id: null,
+          p_order_id: null,
+          p_metadata: { error: message },
+        }
+      );
+      if (errorLogError) {
+        // Re-throw to outer catch so we at least get a console.error.
+        throw errorLogError;
+      }
     } catch (logErr) {
       console.error("Erro ao registrar log:", logErr);
     }

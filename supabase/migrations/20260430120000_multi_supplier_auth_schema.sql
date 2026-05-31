@@ -294,3 +294,63 @@ WITH CHECK (
     WHERE sa.id = (select auth.uid())
   )
 );
+
+
+-- ═══════════════════════════════════════════════════════════════════════════
+-- Scope materialization for view_orders_filtered_by_user (added 2026-05-29)
+-- ═══════════════════════════════════════════════════════════════════════════
+-- Materializa o conjunto (comprador company_user, supplier) derivado das
+-- regras supplier_letter + supplier_id em company_users. Substitui o parsing
+-- per-row de string_to_array() na view_orders_filtered_by_user, que era
+-- responsável por ~15% do tempo total de queries PostgREST.
+--
+-- Semântica (preservada do WHERE original da view): para um comprador `cu`,
+-- um supplier `s` está no scope se:
+--   1. cu.supplier_id IS NOT NULL AND s.id = cu.supplier_id (claim direto)
+--   2. cu.supplier_id IS NULL AND letter de cu.supplier_letter casa com
+--      LEFT(s.name, 1), AND s não está claimed por outro company_user na
+--      mesma company
+--   3. cu.supplier_id IS NULL AND '#' em cu.supplier_letter AND
+--      LEFT(s.name, 1) ~ '^[0-9]', AND s não está claimed
+--
+-- Admins não são populados aqui (a view trata a role 'admin' por branch
+-- separado). Fornecedores não usam esta tabela.
+--
+-- A tabela é mantida por triggers definidas em
+-- 20260430120100_multi_supplier_auth_functions_views.sql.
+
+CREATE TABLE IF NOT EXISTS private.company_user_supplier_scope (
+  company_user_id UUID NOT NULL
+    REFERENCES public.company_users(id) ON DELETE CASCADE,
+  supplier_id BIGINT NOT NULL
+    REFERENCES public.suppliers(id) ON DELETE CASCADE,
+  PRIMARY KEY (company_user_id, supplier_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_cuss_company_user
+  ON private.company_user_supplier_scope (company_user_id);
+
+CREATE INDEX IF NOT EXISTS idx_cuss_supplier
+  ON private.company_user_supplier_scope (supplier_id);
+
+COMMENT ON TABLE private.company_user_supplier_scope IS
+  'Materialized scope of (comprador company_user, supplier) pairs derived from company_users.supplier_letter + supplier_id rules. Refreshed by triggers on company_users and suppliers.';
+
+-- Permissions: schema private não é exposto via PostgREST, mas damos GRANT
+-- SELECT para authenticated porque a view view_orders_filtered_by_user usa
+-- security_invoker = true e precisa ler como o caller.
+REVOKE ALL ON TABLE private.company_user_supplier_scope FROM PUBLIC;
+GRANT SELECT ON TABLE private.company_user_supplier_scope TO authenticated;
+
+-- RLS: a proteção real vem do schema private + GRANT acima. A policy
+-- USING (true) silencia o advisor do Supabase e formaliza que authenticated
+-- pode ler qualquer linha (a view filtra por cu.id = auth.uid() antes do
+-- EXISTS no scope, então não há vazamento).
+ALTER TABLE private.company_user_supplier_scope ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS allow_authenticated_read_scope
+  ON private.company_user_supplier_scope;
+CREATE POLICY allow_authenticated_read_scope
+  ON private.company_user_supplier_scope
+  FOR SELECT TO authenticated
+  USING (true);

@@ -49,11 +49,14 @@ SELECT cron.schedule(
 -- ┃                  Jobs de automações e followups                    ┃
 -- ╰────────────────────────────────────────────────────────────────────╯
 
--- Cron para identificar e enfileirar follow-ups agendados a cada minuto
+-- Cron para identificar e enfileirar follow-ups agendados a cada 15 minutos.
+-- A cadência das regras de followup é medida em DIAS (send_days_interval), então
+-- 15min de latência é insignificante. Mudou de '* * * * *' (cada minuto) em
+-- 2026-05-29 para aliviar pressão de pool durante picos de tráfego.
 -- (erros são tratados apenas via logs no banco; notify-ops é exclusivo da Edge send-followup)
 SELECT cron.schedule(
   'execute-scheduled-followups',
-  '* * * * *',  -- Todo início de hora (UTC)
+  '*/15 * * * *',  -- a cada 15 minutos
   'SELECT * FROM private.fn_execute_scheduled_followups_with_alert();'
 );
 

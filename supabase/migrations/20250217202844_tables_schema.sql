@@ -602,3 +602,53 @@ CREATE INDEX idx_followup_item_tracking_item_setting ON private.followup_item_tr
 CREATE INDEX idx_followup_item_tracking_company ON private.followup_item_tracking(company_id);
 CREATE INDEX idx_followup_item_tracking_order ON private.followup_item_tracking(order_id);
 CREATE INDEX idx_followup_item_tracking_order_setting ON private.followup_item_tracking(order_id, setting_id);
+
+
+-- ╭────────────────────────────────────────────────────────────────────╮
+-- ┃  Performance indexes (added 2026-05-29)                            ┃
+-- ╰────────────────────────────────────────────────────────────────────╯
+-- Adicionados durante a auditoria de performance de 2026-05-18 para:
+--   * Acelerar paginação por (company_id, created_at) em listagens
+--   * Permitir pushdown de WHERE order_id = X em view_order_change_logs
+--   * Sustentar o cron de cleanup que faz DELETE WHERE created_at < ...
+
+CREATE INDEX IF NOT EXISTS idx_orders_company_created
+  ON public.orders (company_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_orders_company_status
+  ON public.orders (company_id, status_id);
+
+CREATE INDEX IF NOT EXISTS idx_order_items_order_status
+  ON public.order_items (order_id, status_id);
+
+CREATE INDEX IF NOT EXISTS idx_order_logs_order_created
+  ON public.order_logs (order_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_order_item_logs_item_created
+  ON public.order_item_logs (order_item_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_process_logs_created
+  ON private.process_logs (created_at);
+
+
+-- ╭────────────────────────────────────────────────────────────────────╮
+-- ┃  Aggressive autovacuum for append-heavy log tables (2026-05-29)    ┃
+-- ╰────────────────────────────────────────────────────────────────────╯
+-- O default autovacuum_vacuum_scale_factor = 0.2 raramente dispara em
+-- tabelas predominantemente append-only, deixando-as fragmentadas. Baixamos
+-- pra 0.05 (5% dead tuples) para manter as tabelas saudáveis continuamente.
+
+ALTER TABLE public.order_logs
+  SET (autovacuum_vacuum_scale_factor = 0.05);
+
+ALTER TABLE public.order_item_logs
+  SET (autovacuum_vacuum_scale_factor = 0.05);
+
+ALTER TABLE public.order_notifications
+  SET (autovacuum_vacuum_scale_factor = 0.05);
+
+ALTER TABLE private.process_logs
+  SET (autovacuum_vacuum_scale_factor = 0.05);
+
+ALTER TABLE public.order_and_item_observations
+  SET (autovacuum_vacuum_scale_factor = 0.05);
