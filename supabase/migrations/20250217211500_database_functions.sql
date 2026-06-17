@@ -1716,7 +1716,7 @@ BEGIN
           NOT EXISTS (
             SELECT 1 FROM public.order_items oi
             JOIN public.order_item_status ois ON oi.status_id = ois.id
-            WHERE oi.order_id = o.id AND ois.is_final = FALSE
+            WHERE oi.order_id = o.id AND ois.blocks_followup = FALSE
           )
           OR
           -- Se tem itens não finais, verifica o status do pedido
@@ -1724,7 +1724,7 @@ BEGIN
             EXISTS (
               SELECT 1 FROM public.order_items oi
               JOIN public.order_item_status ois ON oi.status_id = ois.id
-              WHERE oi.order_id = o.id AND ois.is_final = FALSE
+              WHERE oi.order_id = o.id AND ois.blocks_followup = FALSE
             )
             AND (
               (dos.is_final = FALSE AND dos.code != 'concluido')
@@ -1744,7 +1744,7 @@ BEGIN
             NOT EXISTS (
               SELECT 1 FROM public.order_items oi
               JOIN public.order_item_status ois ON oi.status_id = ois.id
-              WHERE oi.order_id = o.id AND ois.is_final = FALSE
+              WHERE oi.order_id = o.id AND ois.blocks_followup = FALSE
             )
             OR
             -- Se tem itens não finais, verifica o status do pedido
@@ -1752,7 +1752,7 @@ BEGIN
               EXISTS (
                 SELECT 1 FROM public.order_items oi
                 JOIN public.order_item_status ois ON oi.status_id = ois.id
-                WHERE oi.order_id = o.id AND ois.is_final = FALSE
+                WHERE oi.order_id = o.id AND ois.blocks_followup = FALSE
               )
               AND (
                 (dos.is_final = FALSE AND dos.code != 'concluido')
@@ -1770,7 +1770,7 @@ BEGIN
           NOT EXISTS (
             SELECT 1 FROM public.order_items oi
             JOIN public.order_item_status ois ON oi.status_id = ois.id
-            WHERE oi.order_id = o.id AND ois.is_final = FALSE
+            WHERE oi.order_id = o.id AND ois.blocks_followup = FALSE
           )
           OR
           -- Se tem itens não finais, verifica o status do pedido
@@ -1778,7 +1778,7 @@ BEGIN
             EXISTS (
               SELECT 1 FROM public.order_items oi
               JOIN public.order_item_status ois ON oi.status_id = ois.id
-              WHERE oi.order_id = o.id AND ois.is_final = FALSE
+              WHERE oi.order_id = o.id AND ois.blocks_followup = FALSE
             )
             AND (
               (dos.is_final = FALSE AND dos.code != 'concluido')
@@ -1827,7 +1827,7 @@ BEGIN
                   NOT EXISTS (
                     SELECT 1 FROM public.order_items oi2
                     JOIN public.order_item_status ois2 ON oi2.status_id = ois2.id
-                    WHERE oi2.order_id = o.id AND ois2.is_final = FALSE
+                    WHERE oi2.order_id = o.id AND ois2.blocks_followup = FALSE
                   )
                   OR
                   -- Se tem itens não finais, verifica o status do pedido
@@ -1835,7 +1835,7 @@ BEGIN
                     EXISTS (
                       SELECT 1 FROM public.order_items oi2
                       JOIN public.order_item_status ois2 ON oi2.status_id = ois2.id
-                      WHERE oi2.order_id = o.id AND ois2.is_final = FALSE
+                      WHERE oi2.order_id = o.id AND ois2.blocks_followup = FALSE
                     )
                     AND (
                       (dos.is_final = FALSE AND dos.code != 'concluido')
@@ -2164,7 +2164,7 @@ BEGIN
         EXISTS (
           SELECT 1 FROM public.order_items oi
           JOIN public.order_item_status ois ON oi.status_id = ois.id
-          WHERE oi.order_id = o.id AND ois.is_final = FALSE
+          WHERE oi.order_id = o.id AND ois.blocks_followup = FALSE
         )
         AND (
           (dos.is_final = FALSE AND dos.code != 'concluido')
@@ -2184,7 +2184,7 @@ BEGIN
           EXISTS (
             SELECT 1 FROM public.order_items oi
             JOIN public.order_item_status ois ON oi.status_id = ois.id
-            WHERE oi.order_id = o.id AND ois.is_final = FALSE
+            WHERE oi.order_id = o.id AND ois.blocks_followup = FALSE
           )
           AND (
             (dos.is_final = FALSE AND dos.code != 'concluido')
@@ -2209,7 +2209,7 @@ BEGIN
           EXISTS (
             SELECT 1 FROM public.order_items oi
             JOIN public.order_item_status ois ON oi.status_id = ois.id
-            WHERE oi.order_id = o.id AND ois.is_final = FALSE
+            WHERE oi.order_id = o.id AND ois.blocks_followup = FALSE
           )
           AND (
             (dos.is_final = FALSE AND dos.code != 'concluido')
@@ -2264,7 +2264,7 @@ BEGIN
                   AND EXISTS (
                     SELECT 1 FROM public.order_items oi2
                     JOIN public.order_item_status ois2 ON oi2.status_id = ois2.id
-                    WHERE oi2.order_id = o.id AND ois2.is_final = FALSE
+                    WHERE oi2.order_id = o.id AND ois2.blocks_followup = FALSE
                   )
                   AND (
                     (dos.is_final = FALSE AND dos.code != 'concluido')
@@ -2938,7 +2938,7 @@ BEGIN
       EXISTS (
         SELECT 1 FROM public.order_items oi
         JOIN public.order_item_status ois ON oi.status_id = ois.id
-        WHERE oi.order_id = o.id AND ois.is_final = FALSE
+        WHERE oi.order_id = o.id AND ois.blocks_followup = FALSE
       )
       AND (
         (dos.is_final = FALSE AND dos.code != 'concluido')
@@ -3008,7 +3008,7 @@ BEGIN
       EXISTS (
         SELECT 1 FROM public.order_items oi
         JOIN public.order_item_status ois ON oi.status_id = ois.id
-        WHERE oi.order_id = o.id AND ois.is_final = FALSE
+        WHERE oi.order_id = o.id AND ois.blocks_followup = FALSE
       )
       AND (
         (dos.is_final = FALSE AND dos.code != 'concluido')
@@ -3076,7 +3076,7 @@ BEGIN
       EXISTS (
         SELECT 1 FROM public.order_items oi2
         JOIN public.order_item_status ois2 ON oi2.status_id = ois2.id
-        WHERE oi2.order_id = o.id AND ois2.is_final = FALSE
+        WHERE oi2.order_id = o.id AND ois2.blocks_followup = FALSE
       )
       AND (
         (dos.is_final = FALSE AND dos.code != 'concluido')
@@ -3144,7 +3144,7 @@ BEGIN
       EXISTS (
         SELECT 1 FROM public.order_items oi2
         JOIN public.order_item_status ois2 ON oi2.status_id = ois2.id
-        WHERE oi2.order_id = o.id AND ois2.is_final = FALSE
+        WHERE oi2.order_id = o.id AND ois2.blocks_followup = FALSE
       )
       AND (
         (dos.is_final = FALSE AND dos.code != 'concluido')
@@ -3211,7 +3211,7 @@ BEGIN
       EXISTS (
         SELECT 1 FROM public.order_items oi2
         JOIN public.order_item_status ois2 ON oi2.status_id = ois2.id
-        WHERE oi2.order_id = o.id AND ois2.is_final = FALSE
+        WHERE oi2.order_id = o.id AND ois2.blocks_followup = FALSE
       )
       AND (
         (dos.is_final = FALSE AND dos.code != 'concluido')
@@ -3548,13 +3548,13 @@ BEGIN
           NOT EXISTS (
             SELECT 1 FROM public.order_items oi2
             JOIN public.order_item_status ois2 ON oi2.status_id = ois2.id
-            WHERE oi2.order_id = o.id AND ois2.is_final = FALSE
+            WHERE oi2.order_id = o.id AND ois2.blocks_followup = FALSE
           )
           OR (
             EXISTS (
               SELECT 1 FROM public.order_items oi2
               JOIN public.order_item_status ois2 ON oi2.status_id = ois2.id
-              WHERE oi2.order_id = o.id AND ois2.is_final = FALSE
+              WHERE oi2.order_id = o.id AND ois2.blocks_followup = FALSE
             )
             AND (
               (dos.is_final = FALSE AND dos.code != 'concluido')

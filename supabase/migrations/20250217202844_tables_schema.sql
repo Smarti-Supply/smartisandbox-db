@@ -211,6 +211,7 @@ CREATE TABLE public.order_item_status (
     color TEXT NOT NULL DEFAULT '#FFFFFF',              -- Cor padrão branca
     position INT NOT NULL DEFAULT 1,                    -- Ordem dos status no fluxo
     is_final BOOLEAN NOT NULL DEFAULT FALSE,            -- Indica se esse status é finalizador
+    blocks_followup BOOLEAN NOT NULL DEFAULT FALSE,     -- Bloqueia followup automático (desacoplado de is_final)
     expose_to_supplier BOOLEAN NOT NULL DEFAULT FALSE,  -- Se o status é visível para fornecedores
     default_status_id BIGINT,                           -- Referência ao status global (atribui esse status global quando o status do item for...)    
     created_at TIMESTAMP DEFAULT now() NOT NULL,

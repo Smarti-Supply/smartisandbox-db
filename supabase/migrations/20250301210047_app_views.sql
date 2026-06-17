@@ -441,7 +441,8 @@ SELECT
     ois.expose_to_supplier,
     ois.default_status_id,
     dos.name AS default_status_name,  -- Nome do status global ao invés do ID
-    ois.created_at
+    ois.created_at,
+    ois.blocks_followup               -- Bloqueia followup automático (desacoplado de is_final); coluna no fim p/ CREATE OR REPLACE
 FROM public.order_item_status ois
 LEFT JOIN public.default_order_status dos ON ois.default_status_id = dos.id;
 
