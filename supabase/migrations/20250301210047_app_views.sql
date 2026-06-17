@@ -591,10 +591,11 @@ WITH combined_logs AS (
                 'Data de vencimento alterada de "' || COALESCE(ol.old_due_date::TEXT, 'N/A') || '" para "' || COALESCE(ol.new_due_date::TEXT, 'N/A') || '"'
             WHEN ol.old_order_number IS DISTINCT FROM ol.new_order_number THEN 
                 'Número do pedido alterado de "' || COALESCE(ol.old_order_number, 'N/A') || '" para "' || COALESCE(ol.new_order_number, 'N/A') || '"'
-            WHEN ol.old_order_description IS DISTINCT FROM ol.new_order_description THEN 
+            WHEN ol.old_order_description IS DISTINCT FROM ol.new_order_description THEN
                 'Descrição do pedido alterada'
             ELSE 'Alteração realizada'
-        END AS change_description
+        END AS change_description,
+        NULL AS attachment_name
     FROM public.order_logs ol
     JOIN public.orders o ON o.id = ol.order_id
     JOIN public.suppliers s ON s.id = o.supplier_id
@@ -663,18 +664,94 @@ WITH combined_logs AS (
             WHEN oil.old_current_delivery_date IS DISTINCT FROM oil.new_current_delivery_date THEN 
                 'Data de entrega alterada de "' || COALESCE(oil.old_current_delivery_date::TEXT, 'N/A') || '" para "' || COALESCE(oil.new_current_delivery_date::TEXT, 'N/A') || '"'
             ELSE 'Alteração realizada no item'
-        END AS change_description
+        END AS change_description,
+        NULL AS attachment_name
     FROM public.order_item_logs oil
     JOIN public.order_items oi ON oi.id = oil.order_item_id
     JOIN public.orders o ON o.id = oi.order_id
     JOIN public.suppliers s ON s.id = o.supplier_id
     LEFT JOIN public.order_item_status ois_old ON ois_old.id = oil.old_status_id
     LEFT JOIN public.order_item_status ois_new ON ois_new.id = oil.new_status_id
+
+    UNION ALL
+
+    -- Logs de anexos do fornecedor (lidos direto do Storage, bucket po-nfe-files).
+    -- Não há tabela de tracking: nome do arquivo = último segmento do path
+    -- (company_id/order_id/arquivo), data de upload = storage.objects.created_at,
+    -- autor = storage.objects.owner (uuid de auth), mapeado para supplier_contacts
+    -- via supplier_users (ou para company_users quando o upload vem do cliente).
+    SELECT
+        'attachment' AS log_type,
+        NULL::BIGINT AS id,
+        af.order_id,
+        NULL::BIGINT AS order_item_id,
+        cu_up.id AS changed_by_client,
+        su.supplier_contact_id AS changed_by_supplier,
+        af.bucket_id AS source,
+        af.created_at,
+        -- Informações do pedido
+        o.order_number,
+        o.order_description,
+        s.name AS supplier_name,
+        NULL AS old_status_name,
+        NULL AS new_status_name,
+        NULL::DATE AS old_due_date,
+        NULL::DATE AS new_due_date,
+        NULL AS old_order_number,
+        NULL AS new_order_number,
+        NULL AS old_order_description,
+        NULL AS new_order_description,
+        NULL AS change_reason,
+        'attachment_uploaded' AS change_type,
+        'Anexo adicionado' AS change_type_label,
+        'Anexou o arquivo "' || af.file_name || '"' AS change_description,
+        af.file_name AS attachment_name
+    FROM (
+        SELECT
+            so.owner,
+            so.bucket_id,
+            (so.created_at AT TIME ZONE 'America/Sao_Paulo') AS created_at,
+            CASE
+                WHEN (storage.foldername(so.name))[2] ~ '^[0-9]+$'
+                    THEN (storage.foldername(so.name))[2]::BIGINT
+                ELSE NULL::BIGINT
+            END AS order_id,
+            regexp_replace(so.name, '^[0-9]+/[0-9]+/', '') AS file_name
+        FROM storage.objects so
+        WHERE so.bucket_id = 'po-nfe-files'
+          AND (storage.foldername(so.name))[2] ~ '^[0-9]+$'
+    ) af
+    JOIN public.orders o ON o.id = af.order_id
+    JOIN public.suppliers s ON s.id = o.supplier_id
+    LEFT JOIN public.supplier_users su ON su.auth_user_id = af.owner
+    LEFT JOIN public.company_users cu_up ON cu_up.id = af.owner
 )
-SELECT 
-    cl.*,
+SELECT
+    cl.log_type,
+    cl.id,
+    cl.order_id,
+    cl.order_item_id,
+    cl.changed_by_client,
+    cl.changed_by_supplier,
+    cl.source,
+    cl.created_at,
+    cl.order_number,
+    cl.order_description,
+    cl.supplier_name,
+    cl.old_status_name,
+    cl.new_status_name,
+    cl.old_due_date,
+    cl.new_due_date,
+    cl.old_order_number,
+    cl.new_order_number,
+    cl.old_order_description,
+    cl.new_order_description,
+    cl.change_reason,
+    cl.change_type,
+    cl.change_type_label,
+    cl.change_description,
     -- Informações do usuário que fez a alteração
-    CASE 
+    CASE
         WHEN cl.changed_by_client IS NOT NULL THEN cu.name
         WHEN cl.changed_by_supplier IS NOT NULL THEN sc.name
         ELSE 'Sistema'
@@ -704,7 +781,9 @@ SELECT
         WHEN cl.created_at > NOW() - INTERVAL '7 days' THEN 
             EXTRACT(DAY FROM NOW() - cl.created_at)::TEXT || ' dias atrás'
         ELSE TO_CHAR(cl.created_at, 'DD/MM/YYYY')
-    END AS relative_time
+    END AS relative_time,
+    -- Nome do arquivo anexado (apenas log_type = 'attachment'; NULL nos demais)
+    cl.attachment_name
 FROM combined_logs cl
 LEFT JOIN public.company_users cu ON cu.id = cl.changed_by_client
 LEFT JOIN public.supplier_contacts sc ON sc.id = cl.changed_by_supplier

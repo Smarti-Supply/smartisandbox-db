@@ -1218,8 +1218,10 @@ BEGIN
     jsonb_build_object(
       'created_at', created_at,
       'formatted_created_at', formatted_created_at,
+      'change_type', change_type,
       'change_type_label', change_type_label,
       'change_description', change_description,
+      'attachment_name', attachment_name,
       'item_number', item_number,
       'changed_by_name', changed_by_name,
       'changed_by_email', changed_by_email,
